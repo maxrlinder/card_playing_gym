@@ -35,7 +35,7 @@ from torch import nn
 
 from cardgym.games.base import CriticModel, PolicyModel
 from cardgym.nn.model import value_mlp
-from cardgym.nn.trunk import RMSNorm, TrunkConfig, ValueEmbeddingMode, init_weights
+from cardgym.nn.trunk import TrunkConfig, ValueEmbeddingMode, init_weights
 
 from .cards import CARD_RANKS, NO_CARD, NUM_CARDS, NUM_RANKS, NUM_SUITS
 from .engine import MAX_PLAYERS, NUM_ACTION_KINDS
@@ -86,21 +86,51 @@ class RummyModelConfig:
             raise ValueError("[model] ledger_kernel must be odd and at most 13.")
 
 
+class FusedRMSNorm(nn.Module):
+    """RMSNorm through ``F.rms_norm`` (same function and parameters as the trunk's).
+
+    The trunk's op-by-op RMSNorm backward, rerun from MPS's graph cache at a
+    few hundred rows (the policy head's decisions), returned all-NaN input
+    gradients in 1 of 4 policy passes; the fused op returned none in 48 and
+    matches a CPU fp32 reference to bf16 accuracy.
+    """
+
+    def __init__(self, d: int, eps: float = 1e-5) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.rms_norm(x.float(), (x.shape[-1],), self.weight.float(), self.eps).to(x.dtype)
+
+
 class GridBlock(nn.Module):
     """Residual mix of rank neighbours (circular) and same-rank suits on the card grid."""
 
     def __init__(self, width: int, hidden: int, kernel: int) -> None:
         super().__init__()
-        self.norm = RMSNorm(width)
-        self.along_rank = nn.Conv1d(width, hidden, kernel, padding=kernel // 2, padding_mode="circular")
+        self.kernel = kernel
+        self.norm = FusedRMSNorm(width)
+        # Conv1d parameters, applied as one matmul over the circular rank
+        # window (MPS convolution backward returns permuted-stride gradients).
+        self.along_rank = nn.Conv1d(width, hidden, kernel)
         self.across_suits = nn.Linear(width, hidden, bias=False)
         self.out = nn.Linear(hidden, width)
 
     def forward(self, grid: torch.Tensor) -> torch.Tensor:  # [N, suits, ranks, width]
-        n, suits, ranks, width = grid.shape
+        ranks = grid.shape[2]
         y = self.norm(grid)
-        along = self.along_rank(y.reshape(n * suits, ranks, width).transpose(1, 2))
-        along = along.transpose(1, 2).reshape(n, suits, ranks, -1)
+        half = self.kernel // 2
+        # Window entry j of rank r is rank (r + j - half) mod 13, as in a
+        # circularly padded convolution.
+        window = torch.cat(
+            [torch.cat([y[:, :, shift:], y[:, :, :shift]], dim=2) for shift in (
+                (offset % ranks) for offset in range(-half, half + 1)
+            )],
+            dim=-1,
+        )
+        conv = self.along_rank
+        along = F.linear(window, conv.weight.permute(0, 2, 1).reshape(conv.out_channels, -1), conv.bias)
         across = self.across_suits(y.mean(dim=1, keepdim=True))
         return grid + self.out(F.gelu(along + across))
 
@@ -117,7 +147,7 @@ class CardGrid(nn.Module):
         self.blocks = nn.ModuleList(
             GridBlock(width, config.ledger_hidden, config.ledger_kernel) for _ in range(config.ledger_layers)
         )
-        self.norm = RMSNorm(width)
+        self.norm = FusedRMSNorm(width)
         self.summary = nn.Linear(NUM_CARDS * width, config.d_model, bias=False)
         for module in (self.code, self.rank, *self.blocks):
             module.apply(init_weights)

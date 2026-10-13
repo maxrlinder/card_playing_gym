@@ -22,6 +22,12 @@ games. Every upload and every logits download is non-blocking and the host
 waits only on the fence of the cohort it is about to step; on MPS a blocking
 copy would wait for all queued work, including the other cohort's.
 
+Decode shapes are bucketed (live rows to a multiple of 64, the attention span
+to a multiple of 32, policy reads to fixed decision and candidate counts).
+MPS compiles a graph per tensor shape; exact shapes change every wave and
+measured 24-27 ms per forward against 15.5 ms bucketed. Padding rows write
+only to cache rows past the live prefix and their outputs are dropped.
+
 A game plugs in through :class:`SelfPlayGame`. It owns all rules and all
 tokenization; the collector only moves token blocks and samples actions.
 """
@@ -150,7 +156,16 @@ class _Cohort:
     keep: list[np.ndarray] = field(default_factory=list)
 
 
+def _round_up(value: int, multiple: int) -> int:
+    return -(-value // multiple) * multiple
+
+
 class SelfPlayCollector:
+    ROW_BUCKET = 64
+    SPAN_BUCKET = 32
+    DECISION_BUCKET = 16
+    CANDIDATE_BUCKET = 8
+
     def __init__(
         self,
         model,
@@ -347,10 +362,12 @@ class SelfPlayCollector:
         started = time.perf_counter()
         run = max(len(block) for _, blocks in appends for block in blocks)
         live_rows = appends[-1][0].base + appends[-1][0].game.num_players
+        rows = max(live_rows, min(_round_up(live_rows, self.ROW_BUCKET), cohort.cache.capacity))
         width = next(block.shape[1] for _, blocks in appends for block in blocks if len(block))
-        tokens = np.zeros((live_rows, run, width), dtype=np.int64)
-        positions = np.zeros(live_rows, dtype=np.int64)
-        offsets = np.zeros(live_rows, dtype=np.int64)
+        # Rows past the live prefix are shape padding: zeros, written at position 0.
+        tokens = np.zeros((rows, run, width), dtype=np.int64)
+        positions = np.zeros(rows, dtype=np.int64)
+        offsets = np.zeros(rows, dtype=np.int64)
         readout_rows: list[int] = []
         readout_states: list[_Live] = []
         longest = 0
@@ -380,10 +397,10 @@ class SelfPlayCollector:
                 self._upload(cohort, positions),
                 cohort.cache,
                 self._upload(cohort, offsets),
-                span=int(positions.max()) + run,
+                span=_round_up(int(positions.max()) + run, self.SPAN_BUCKET),
             )
-        self.stats.forward_rows += live_rows * run
-        self.stats.padded_rows += live_rows * run - sum(
+        self.stats.forward_rows += rows * run
+        self.stats.padded_rows += rows * run - sum(
             len(block) for _, blocks in appends for block in blocks
         )
         index = self._upload(cohort, np.asarray(readout_rows, dtype=np.int64))
@@ -399,11 +416,13 @@ class SelfPlayCollector:
             by_head.setdefault(state.pending.head, []).append(position)
         with autocast_context(self.device, self.precision):
             for head, positions in by_head.items():
-                features = _stack_features([states[p].pending.features for p in positions])
+                # Pad the read to a bucketed size by repeating its first decision.
+                padded = positions + [positions[0]] * (_round_up(len(positions), self.DECISION_BUCKET) - len(positions))
+                features = _stack_features([states[p].pending.features for p in padded], self.CANDIDATE_BUCKET)
                 if features is not None:
                     features = {key: self._upload(cohort, value) for key, value in features.items()}
-                index = self._upload(cohort, np.asarray(positions, dtype=np.int64))
-                tokens = self._upload(cohort, np.stack([states[p].readout for p in positions]).astype(np.int64))
+                index = self._upload(cohort, np.asarray(padded, dtype=np.int64))
+                tokens = self._upload(cohort, np.stack([states[p].readout for p in padded]).astype(np.int64))
                 logits = self.model.policy_logits(hidden[index], head, features, tokens)
                 cohort.launched.append(
                     ([states[p] for p in positions], logits.float().to("cpu", non_blocking=True))
@@ -457,12 +476,14 @@ class SelfPlayCollector:
             self.stats.decisions += len(group)
 
 
-def _stack_features(features: list[dict[str, np.ndarray] | None]) -> dict[str, np.ndarray] | None:
+def _stack_features(
+    features: list[dict[str, np.ndarray] | None], bucket: int = 1
+) -> dict[str, np.ndarray] | None:
     """Pad per-decision candidate features along the candidate axis and stack."""
 
     if features[0] is None:
         return None
-    count = max(next(iter(entry.values())).shape[0] for entry in features)
+    count = _round_up(max(next(iter(entry.values())).shape[0] for entry in features), bucket)
     stacked: dict[str, np.ndarray] = {}
     for key in features[0]:
         first = features[0][key]
