@@ -1,0 +1,50 @@
+[project]
+name = "card-playing-gym"
+version = "0.1.0"
+description = "Self-play reinforcement learning gym for imperfect-information card games."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "matplotlib>=3.10.9",
+    "numpy>=2.0",
+    "torch==2.13.0.dev20260518; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+[project.scripts]
+cardgym = "cardgym.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.uv]
+package = true
+prerelease = "explicit"
+environments = [
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+[tool.uv.sources]
+torch = [
+    { url = "https://download-r2.pytorch.org/whl/nightly/cpu/torch-2.13.0.dev20260518-cp311-cp311-macosx_14_0_arm64.whl", marker = "python_version == '3.11' and sys_platform == 'darwin' and platform_machine == 'arm64'" },
+    { url = "https://download-r2.pytorch.org/whl/nightly/cpu/torch-2.13.0.dev20260518-cp312-cp312-macosx_14_0_arm64.whl", marker = "python_version == '3.12' and sys_platform == 'darwin' and platform_machine == 'arm64'" },
+]
+
+[tool.uv.build-backend]
+module-name = "cardgym"
+module-root = ""
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]

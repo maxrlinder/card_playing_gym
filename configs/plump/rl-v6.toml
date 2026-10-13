@@ -1,0 +1,80 @@
+# rl-v6: self-play PPO with an oracle critic, as of the published checkpoint
+# (checkpoints/plump/rl-v6, iteration 71k). Continue training from it with
+#
+#   cardgym plump train rl-v6 --config configs/plump/rl-v6.toml \
+#     --init-from checkpoints/plump/rl-v6
+#
+# Lineage: a 16-layer student distilled from a 6-layer PPO teacher, then
+# trained here from iteration 0. Entropy targets ramped 0.25/0.25 -> 0.10/0.15
+# (iterations 9.2k-14.9k) and -> 0.05/0.10 during a learning-rate cooldown
+# (56.2k-66k, rate 4.5e-5 -> 4.5e-6); from 71.1k the rate is 9e-6 with 116
+# deals per shape. The values below are that final state.
+
+[run]
+game = "plump"
+iterations = 100000
+checkpoint_every = 100
+dashboard_every = 5
+device = "auto"
+# bf16 autocast with fp32 master weights; with CARDGYM_METAL_TRUNK=1 on
+# Apple silicon the fused trunk roughly halves iteration time.
+precision = "bf16"
+seed = 0
+
+[rollout]
+# fp16 cached K/V measured faster than bf16 for cached attention on MPS.
+kv_dtype = "fp16"
+# 116 deals x (3+4+5 seats) x 8 hand sizes = 11136 rows: one merged loop.
+max_rows = 12288
+
+[model]
+max_players = 5
+max_hand_size = 10
+d_model = 240
+n_layers = 16
+n_heads = 10
+n_kv_heads = 2
+d_ff = 720
+per_layer_dim = 64
+value_embeddings = "alternating"
+
+[ppo]
+learning_rate = 0.000009
+lr_warmup_updates = 100
+lr_schedule = "constant"
+epochs = 1
+max_grad_norm = 1.0
+clip_ratio = 0.10
+advantage_estimator = "monte_carlo"
+gae_lambda = 0.95
+advantage_normalize = true
+# Measured: the policy gradient outweighs the auxiliary one ~15x by norm and
+# the ratio does not decay, so the auxiliaries get an explicit 25% budget.
+auxiliary_grad_fraction = 0.25
+critic_learning_rate = 0.0003
+critic_epochs = 2
+value_reward_scale = 5.0
+actor_value_coef = 0.2
+entropy_mode = "adaptive"
+entropy_coef = 0.01
+entropy_learning_rate = 0.001
+entropy_targets = { bid = 0.05, play = 0.10 }
+entropy_target_schedule = "constant"
+# The update's memory lever: 16384 positions peaked near 9.8 GB with this
+# model; 24576 bought 4% speed for 3 GB more on a 24 GB machine.
+microbatch_positions = 16384
+sequence_bucket_width = 16
+critic_sequence_bucket_width = 32
+
+[game]
+hand_sizes = [3, 4, 5, 6, 7, 8, 9, 10]
+player_counts = [3, 4, 5]
+deals_per_shape = 116
+
+[losses]
+suit = 0.1
+rank_boundary = 0.2
+trick = 0.2
+next_winner = 0.2
+bid_hit = 0.2
+card_order = 0.05
