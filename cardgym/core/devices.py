@@ -42,6 +42,39 @@ def autocast_context(device: torch.device, precision: str):
     return torch.autocast(device_type=device.type, dtype=DTYPES[precision])
 
 
+class Fence:
+    """A point in the device's work queue that the host can wait for.
+
+    On MPS a blocking copy (``.cpu()``, ``.to(device)``, ``torch.tensor(...,
+    device=...)``) waits for *all* queued work, so a host that must not stall
+    behind unrelated kernels uploads and downloads with ``non_blocking=True``
+    and waits on a fence recorded right after the work it needs.
+    """
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self._event = None
+        if device.type == "mps":
+            self._event = torch.mps.Event()
+            self._event.record()
+        elif device.type == "cuda":
+            self._event = torch.cuda.Event()
+            self._event.record()
+
+    def wait(self) -> None:
+        if self._event is not None:
+            self._event.synchronize()
+
+
+def to_device(array, device: torch.device) -> torch.Tensor:
+    """Upload a numpy array without waiting for queued device work.
+
+    The caller keeps ``array`` alive until a later fence has been waited on.
+    """
+
+    return torch.from_numpy(array).to(device, non_blocking=True)
+
+
 def release_device_memory(device: torch.device) -> None:
     """Return cached allocator blocks; MPS otherwise keeps its high-water mark."""
 

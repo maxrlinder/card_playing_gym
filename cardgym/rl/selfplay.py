@@ -15,6 +15,13 @@ slower). Games are therefore dealt longest-lived first so retirement clears
 rows from the tail; a game that finishes out of turn triggers a compaction
 that slides the survivors down, which keeps the invariant exact.
 
+Cohorts overlap host and device. With ``cohorts = 2`` the games are split
+into two groups with their own caches, and the loop alternates: while the
+device decodes one cohort's wave, the host samples and steps the other's
+games. Every upload and every logits download is non-blocking and the host
+waits only on the fence of the cohort it is about to step; on MPS a blocking
+copy would wait for all queued work, including the other cohort's.
+
 A game plugs in through :class:`SelfPlayGame`. It owns all rules and all
 tokenization; the collector only moves token blocks and samples actions.
 """
@@ -29,7 +36,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
-from cardgym.core.devices import DTYPES, autocast_context, release_device_memory
+from cardgym.core.devices import DTYPES, Fence, autocast_context, release_device_memory, to_device
 
 from .ppo import masked_probabilities, sample_rows
 
@@ -114,7 +121,8 @@ class CollectionStats:
     peak_rows: int = 0
     compactions: int = 0
     collect_sec: float = 0.0
-    forward_sec: float = 0.0
+    forward_sec: float = 0.0  # host time preparing and launching device work
+    wait_sec: float = 0.0  # host time blocked on the device
     sample_sec: float = 0.0
     step_sec: float = 0.0
 
@@ -131,6 +139,17 @@ class _Live:
     logits: np.ndarray | None = None
 
 
+@dataclass
+class _Cohort:
+    cache: object
+    live: list[tuple[int, _Live]]
+    # Launched policy reads: the states and their logits on the way to the host.
+    launched: list[tuple[list[_Live], torch.Tensor]] = field(default_factory=list)
+    fence: Fence | None = None
+    # Host arrays that in-flight non-blocking uploads still read from.
+    keep: list[np.ndarray] = field(default_factory=list)
+
+
 class SelfPlayCollector:
     def __init__(
         self,
@@ -141,21 +160,23 @@ class SelfPlayCollector:
         kv_dtype: str,
         max_rows: int,
         max_length: int,
+        cohorts: int = 1,
     ) -> None:
         self.model = model
         self.device = device
         self.precision = precision
         self.kv_dtype = DTYPES[kv_dtype]
         self.max_rows = max_rows
+        self.cohorts = max(1, cohorts)
         # One spare slot past the longest stream absorbs ragged padding.
         self.cache_length = max_length + 1
-        self._cache = None
+        self._caches: dict[int, object] = {}
         self.stats = CollectionStats()
 
     def release(self) -> None:
-        """Drop the KV pool; it is dead weight during the update's backward."""
+        """Drop the KV pools; they are dead weight during the update's backward."""
 
-        self._cache = None
+        self._caches = {}
         release_device_memory(self.device)
 
     @torch.inference_mode()
@@ -180,62 +201,79 @@ class SelfPlayCollector:
 
     # ------------------------------------------------------------------
 
-    def _ensure_cache(self, rows: int):
-        cache = self._cache
+    def _ensure_cache(self, slot: int, rows: int):
+        cache = self._caches.get(slot)
         if cache is None or cache.capacity < rows:
-            self._cache = None
+            self._caches.pop(slot, None)
             release_device_memory(self.device)
             capacity = max(rows, min(self.max_rows, rows + rows // 4))
-            self._cache = self.model.new_cache(capacity, self.cache_length, self.kv_dtype)
-        return self._cache
+            cache = self.model.new_cache(capacity, self.cache_length, self.kv_dtype)
+            self._caches[slot] = cache
+        return cache
 
     def _run(self, indices: list[int], games: list[SelfPlayGame], results: dict[int, Trajectory]) -> None:
-        total_rows = sum(games[index].num_players for index in indices)
-        cache = self._ensure_cache(total_rows)
-        live: list[tuple[int, _Live]] = []
-        row = 0
-        for index in indices:
-            game = games[index]
-            live.append(
-                (
-                    index,
-                    _Live(
-                        game=game,
-                        base=row,
-                        lengths=np.zeros(game.num_players, dtype=np.int64),
-                        blocks=[[] for _ in range(game.num_players)],
-                    ),
+        count = min(self.cohorts, len(indices))
+        cohorts: list[_Cohort] = []
+        total_rows = 0
+        for slot in range(count):
+            # Interleaving keeps each cohort's lifetimes in descending order.
+            members = indices[slot::count]
+            rows = sum(games[index].num_players for index in members)
+            total_rows += rows
+            live: list[tuple[int, _Live]] = []
+            row = 0
+            for index in members:
+                game = games[index]
+                live.append(
+                    (
+                        index,
+                        _Live(
+                            game=game,
+                            base=row,
+                            lengths=np.zeros(game.num_players, dtype=np.int64),
+                            blocks=[[] for _ in range(game.num_players)],
+                        ),
+                    )
                 )
-            )
-            row += game.num_players
+                row += game.num_players
+            cohorts.append(_Cohort(cache=self._ensure_cache(slot, rows), live=live))
         self.stats.peak_rows = max(self.stats.peak_rows, total_rows)
-        self._prefill([state for _, state in live], cache)
-        while live:
-            self.stats.waves += 1
-            t0 = time.perf_counter()
-            self._sample([state for _, state in live])
-            t1 = time.perf_counter()
-            appends: list[tuple[_Live, list[np.ndarray]]] = []
-            survivors: list[tuple[int, _Live]] = []
-            for index, state in live:
-                record = state.decisions[-1]
-                blocks = state.game.step(record.action)
-                for seat, block in enumerate(blocks):
-                    if len(block):
-                        state.blocks[seat].append(block)
-                if state.game.done():
-                    results[index] = self._finish(state)
-                else:
-                    appends.append((state, blocks))
-                    survivors.append((index, state))
-            t2 = time.perf_counter()
-            self.stats.sample_sec += t1 - t0
-            self.stats.step_sec += t2 - t1
-            if len(survivors) != len(live):
-                self._compact(cache, [state for _, state in survivors])
-            live = survivors
-            if appends:
-                self._append(appends, cache)
+        for cohort in cohorts:
+            self._prefill(cohort)
+        while any(cohort.live for cohort in cohorts):
+            for cohort in cohorts:
+                if cohort.live:
+                    self._wave(cohort, results)
+
+    def _wave(self, cohort: _Cohort, results: dict[int, Trajectory]) -> None:
+        """Receive one cohort's policies, act in every live game, launch the next decode."""
+
+        self.stats.waves += 1
+        self._receive(cohort)
+        t0 = time.perf_counter()
+        self._sample([state for _, state in cohort.live])
+        t1 = time.perf_counter()
+        appends: list[tuple[_Live, list[np.ndarray]]] = []
+        survivors: list[tuple[int, _Live]] = []
+        for index, state in cohort.live:
+            record = state.decisions[-1]
+            blocks = state.game.step(record.action)
+            for seat, block in enumerate(blocks):
+                if len(block):
+                    state.blocks[seat].append(block)
+            if state.game.done():
+                results[index] = self._finish(state)
+            else:
+                appends.append((state, blocks))
+                survivors.append((index, state))
+        t2 = time.perf_counter()
+        self.stats.sample_sec += t1 - t0
+        self.stats.step_sec += t2 - t1
+        if len(survivors) != len(cohort.live):
+            self._compact(cohort, [state for _, state in survivors])
+        cohort.live = survivors
+        if appends:
+            self._append(cohort, appends)
 
     def _finish(self, state: _Live) -> Trajectory:
         streams = [np.concatenate(blocks, axis=0) for blocks in state.blocks]
@@ -246,7 +284,11 @@ class SelfPlayCollector:
             returns=np.asarray(state.game.returns(), dtype=np.float64),
         )
 
-    def _compact(self, cache, survivors: list[_Live]) -> None:
+    def _upload(self, cohort: _Cohort, array: np.ndarray) -> torch.Tensor:
+        cohort.keep.append(array)
+        return to_device(array, self.device)
+
+    def _compact(self, cohort: _Cohort, survivors: list[_Live]) -> None:
         """Slide survivors down so live rows stay a dense prefix of the pool."""
 
         sources: list[int] = []
@@ -263,26 +305,27 @@ class SelfPlayCollector:
             row += state.game.num_players
         if sources:
             self.stats.compactions += 1
-            cache.copy_rows(
-                torch.tensor(sources, dtype=torch.long, device=self.device),
-                torch.tensor(targets, dtype=torch.long, device=self.device),
+            cohort.cache.copy_rows(
+                self._upload(cohort, np.asarray(sources, dtype=np.int64)),
+                self._upload(cohort, np.asarray(targets, dtype=np.int64)),
                 length,
             )
 
-    def _prefill(self, states: list[_Live], cache) -> None:
+    def _prefill(self, cohort: _Cohort) -> None:
         """Encode every prefix; rows sharing a prefix length share one forward."""
 
+        started = time.perf_counter()
         groups: dict[int, list[tuple[_Live, int, np.ndarray]]] = {}
-        for state in states:
+        for _, state in cohort.live:
             state.pending = state.game.decision()
             for seat, prefix in enumerate(state.game.prefix_tokens()):
                 groups.setdefault(prefix.shape[0], []).append((state, seat, prefix))
                 state.blocks[seat].append(prefix)
                 state.lengths[seat] = prefix.shape[0]
         for length, entries in groups.items():
-            tokens = torch.from_numpy(np.stack([prefix for _, _, prefix in entries])).to(self.device)
-            rows = torch.tensor(
-                [state.base + seat for state, seat, _ in entries], dtype=torch.long, device=self.device
+            tokens = self._upload(cohort, np.stack([prefix for _, _, prefix in entries]).astype(np.int64))
+            rows = self._upload(
+                cohort, np.asarray([state.base + seat for state, seat, _ in entries], dtype=np.int64)
             )
             readout = [
                 (position, state)
@@ -292,14 +335,15 @@ class SelfPlayCollector:
             for position, state in readout:
                 state.readout = entries[position][2][-1]
             with autocast_context(self.device, self.precision):
-                hidden = self.model.forward_prefill(tokens, cache, rows)
+                hidden = self.model.forward_prefill(tokens, cohort.cache, rows)
             self.stats.forward_rows += len(entries) * length
-            self._read_policies(
-                hidden[torch.tensor([p for p, _ in readout], dtype=torch.long, device=self.device)],
-                [state for _, state in readout],
-            )
+            if readout:
+                index = self._upload(cohort, np.asarray([p for p, _ in readout], dtype=np.int64))
+                self._launch_policies(cohort, hidden[index], [state for _, state in readout])
+        cohort.fence = Fence(self.device)
+        self.stats.forward_sec += time.perf_counter() - started
 
-    def _append(self, appends: list[tuple[_Live, list[np.ndarray]]], cache) -> None:
+    def _append(self, cohort: _Cohort, appends: list[tuple[_Live, list[np.ndarray]]]) -> None:
         started = time.perf_counter()
         run = max(len(block) for _, blocks in appends for block in blocks)
         live_rows = appends[-1][0].base + appends[-1][0].game.num_players
@@ -332,44 +376,53 @@ class SelfPlayCollector:
             raise RuntimeError("A stream outgrew the model's maximum sequence length.")
         with autocast_context(self.device, self.precision):
             hidden = self.model.forward_ragged(
-                torch.from_numpy(tokens).to(self.device),
-                torch.from_numpy(positions).to(self.device),
-                cache,
-                torch.from_numpy(offsets).to(self.device),
+                self._upload(cohort, tokens),
+                self._upload(cohort, positions),
+                cohort.cache,
+                self._upload(cohort, offsets),
+                span=int(positions.max()) + run,
             )
         self.stats.forward_rows += live_rows * run
         self.stats.padded_rows += live_rows * run - sum(
             len(block) for _, blocks in appends for block in blocks
         )
-        self._read_policies(
-            hidden[torch.tensor(readout_rows, dtype=torch.long, device=self.device)],
-            readout_states,
-        )
+        index = self._upload(cohort, np.asarray(readout_rows, dtype=np.int64))
+        self._launch_policies(cohort, hidden[index], readout_states)
+        cohort.fence = Fence(self.device)
         self.stats.forward_sec += time.perf_counter() - started
 
-    def _read_policies(self, hidden: torch.Tensor, states: list[_Live]) -> None:
-        """Evaluate each pending decision's head on its actor's hidden state."""
+    def _launch_policies(self, cohort: _Cohort, hidden: torch.Tensor, states: list[_Live]) -> None:
+        """Queue each pending decision's head on its actor's hidden state."""
 
         by_head: dict[str, list[int]] = {}
         for position, state in enumerate(states):
             by_head.setdefault(state.pending.head, []).append(position)
-        launched = []
         with autocast_context(self.device, self.precision):
             for head, positions in by_head.items():
-                features = _stack_features(
-                    [states[p].pending.features for p in positions], self.device
+                features = _stack_features([states[p].pending.features for p in positions])
+                if features is not None:
+                    features = {key: self._upload(cohort, value) for key, value in features.items()}
+                index = self._upload(cohort, np.asarray(positions, dtype=np.int64))
+                tokens = self._upload(cohort, np.stack([states[p].readout for p in positions]).astype(np.int64))
+                logits = self.model.policy_logits(hidden[index], head, features, tokens)
+                cohort.launched.append(
+                    ([states[p] for p in positions], logits.float().to("cpu", non_blocking=True))
                 )
-                index = torch.tensor(positions, dtype=torch.long, device=self.device)
-                tokens = torch.from_numpy(
-                    np.stack([states[p].readout for p in positions]).astype(np.int64)
-                ).to(self.device)
-                launched.append(
-                    (positions, self.model.policy_logits(hidden[index], head, features, tokens))
-                )
-        for positions, logits in launched:
-            values = logits.float().cpu().numpy()
-            for row, position in enumerate(positions):
-                states[position].logits = values[row]
+
+    def _receive(self, cohort: _Cohort) -> None:
+        """Wait for this cohort's launched policies and hand each state its logits."""
+
+        started = time.perf_counter()
+        if cohort.fence is not None:
+            cohort.fence.wait()
+        self.stats.wait_sec += time.perf_counter() - started
+        for states, logits in cohort.launched:
+            values = logits.numpy()
+            for row, state in enumerate(states):
+                state.logits = values[row]
+        cohort.launched = []
+        cohort.keep = []
+        cohort.fence = None
 
     def _sample(self, states: list[_Live]) -> None:
         by_head: dict[str, list[_Live]] = {}
@@ -404,20 +457,18 @@ class SelfPlayCollector:
             self.stats.decisions += len(group)
 
 
-def _stack_features(
-    features: list[dict[str, np.ndarray] | None], device: torch.device
-) -> dict[str, torch.Tensor] | None:
+def _stack_features(features: list[dict[str, np.ndarray] | None]) -> dict[str, np.ndarray] | None:
     """Pad per-decision candidate features along the candidate axis and stack."""
 
     if features[0] is None:
         return None
     count = max(next(iter(entry.values())).shape[0] for entry in features)
-    stacked: dict[str, torch.Tensor] = {}
+    stacked: dict[str, np.ndarray] = {}
     for key in features[0]:
         first = features[0][key]
         array = np.zeros((len(features), count, *first.shape[1:]), dtype=first.dtype)
         for row, entry in enumerate(features):
             value = entry[key]
             array[row, : value.shape[0]] = value
-        stacked[key] = torch.from_numpy(array).to(device)
+        stacked[key] = array
     return stacked

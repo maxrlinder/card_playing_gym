@@ -109,6 +109,7 @@ def build_components(config: ResolvedConfig, *, device: str | None = None) -> Co
         kv_dtype=config.rollout.kv_dtype,
         max_rows=config.rollout.max_rows,
         max_length=game.max_length,
+        cohorts=config.rollout.cohorts,
     )
     return Components(config=config, device=target, trainer=trainer, collector=collector)
 

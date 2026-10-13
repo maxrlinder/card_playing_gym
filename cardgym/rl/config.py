@@ -35,10 +35,15 @@ class RolloutConfig:
     # Cache rows (one per observer stream) one merged decode loop may hold;
     # a larger schedule is cut into several loops.
     max_rows: int = 12288
+    # Game groups decoded alternately: the device runs one group's wave while
+    # the host steps another's games (2 overlaps them; 1 is lockstep).
+    cohorts: int = 1
 
     def validate(self) -> None:
         if self.max_rows < 1:
             raise ValueError("[rollout] max_rows must be positive.")
+        if self.cohorts < 1:
+            raise ValueError("[rollout] cohorts must be at least 1.")
 
 
 @dataclass(frozen=True)

@@ -317,6 +317,8 @@ def _iteration(components, rng: random.Random, iteration: int) -> dict[str, floa
         "forward_rows": collection.forward_rows,
         "padding_fraction": collection.padded_rows / max(collection.forward_rows, 1),
         "compactions": collection.compactions,
+        # Host time blocked on the device: the rest of collect_sec is host work.
+        "collect_wait_sec": collection.wait_sec,
     }
     row.update(game.rollout_summary(trajectories))
     row.update(stats)

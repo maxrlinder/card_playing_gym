@@ -5,6 +5,7 @@ from __future__ import annotations
 import random
 
 import numpy as np
+import pytest
 import torch
 
 from cardgym.games.rummy.cards import NO_CARD, NUM_CARDS
@@ -161,12 +162,19 @@ def tiny_game(**game) -> RummyGame:
     return RummyGame(model, RummyGameConfig(**settings), RummyLossConfig())
 
 
-def test_cached_rollout_matches_full_replay():
+DEVICES = ["cpu"] + (["mps"] if torch.backends.mps.is_available() else [])
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("cohorts", [1, 2])
+def test_cached_rollout_matches_full_replay(device, cohorts):
+    """Decoding (cached, ragged, cohort-pipelined, async transfers) equals a full replay."""
+
     game = tiny_game()
-    actor = randomize(game.build_actor().eval(), seed=3, scale=0.2)
+    actor = randomize(game.build_actor().eval(), seed=3, scale=0.2).to(device)
     collector = SelfPlayCollector(
-        actor, device=torch.device("cpu"), precision="fp32", kv_dtype="fp32", max_rows=64,
-        max_length=game.max_length,
+        actor, device=torch.device(device), precision="fp32", kv_dtype="fp32", max_rows=64,
+        max_length=game.max_length, cohorts=cohorts,
     )
     trajectories = collector.collect(game.new_games(random.Random(0), 0))
     assert collector.stats.compactions > 0  # games retire out of order
@@ -174,19 +182,19 @@ def test_cached_rollout_matches_full_replay():
     with torch.no_grad():
         for trajectory in trajectories:
             for seat, stream in enumerate(trajectory.streams):
-                tokens = torch.from_numpy(stream.astype(np.int64))[None]
+                tokens = torch.from_numpy(stream.astype(np.int64))[None].to(device)
                 hidden = actor.forward_hidden(tokens)[0]
                 for decision in trajectory.decisions:
                     if decision.seat != seat:
                         continue
-                    features = {k: torch.from_numpy(v)[None] for k, v in decision.features.items()}
+                    features = {k: torch.from_numpy(v)[None].to(device) for k, v in decision.features.items()}
                     logits = actor.policy_logits(
                         hidden[decision.position][None], decision.head, features,
                         tokens[0, decision.position][None],
-                    )
-                    probs = masked_probabilities(logits.numpy(), np.ones_like(logits.numpy(), dtype=bool))[0]
+                    ).cpu().numpy()
+                    probs = masked_probabilities(logits, np.ones_like(logits, dtype=bool))[0]
                     worst = max(worst, float(np.abs(probs - decision.probs).max()))
-    assert worst < 1e-5
+    assert worst < (1e-5 if device == "cpu" else 1e-3)
 
 
 def test_card_grid_is_suit_equivariant():

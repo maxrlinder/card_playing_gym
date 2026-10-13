@@ -359,6 +359,7 @@ class Trunk(nn.Module):
         cache: KVCache,
         positions: torch.Tensor,
         readout_offsets: torch.Tensor,
+        span: int | None = None,
     ) -> torch.Tensor:
         """Append a padded run of tokens to rows 0..B-1, each at its own length.
 
@@ -368,6 +369,8 @@ class Trunk(nn.Module):
         and is never attended to meanwhile. Writes past the pool are clamped
         onto its last slot, which callers reserve as padding-only. Returns
         the final-norm hidden state of token ``readout_offsets[b]`` per row.
+        ``span`` (the longest row after the append) lets callers that know it
+        avoid reading ``positions`` back from the device, which would stall.
         """
 
         length = x.shape[1]
@@ -377,7 +380,9 @@ class Trunk(nn.Module):
             return normed[rows, readout_offsets]
         steps = torch.arange(length, device=positions.device)[None, :]
         write_positions = (positions[:, None] + steps).clamp(max=cache.max_len - 1)
-        span = min(int(positions.max()) + length, cache.max_len)
+        if span is None:
+            span = int(positions.max()) + length
+        span = min(span, cache.max_len)
         for layer, block in enumerate(self.blocks):
             x = block.forward_ragged(
                 x, cache, layer, write_positions, positions + 1, span, self._value(values, layer)
