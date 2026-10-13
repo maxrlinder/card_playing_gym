@@ -174,17 +174,36 @@ and lays off at once, and discards its least connected, highest-value card.
 | | |
 | --- | --- |
 | engine + tokens, Python | ~33 us per decision (`simulate`: 25-60 us per event incl. all ledgers) |
-| stream length, untrained policy | ~250 events (stock-outs); heuristic play ~60-80 |
-| decode wave, 864 rows at span 300 | 34 ms GPU forward (card grid 6 ms, trunk 28 ms) + 2.5 ms per policy head |
-| `behavior_kl` (bf16 compute, fp16 KV cache) | -8e-9: cached rollout equals full replay |
+| stream length | ~250 events untrained (stock-outs); ~130 by iteration 100; heuristic play 60-80 |
+| decode wave | flat ~20 ms up to ~860 rows: bound by per-op host dispatch, not the GPU |
+| rollout, 144 / 288 / 576 games (iteration-100 policy) | 6.5 / 8.0 / 13.5 s (2,841 / 4,518 / 5,397 decisions/s) |
+| `behavior_kl` (bf16 compute, fp16 KV cache) | ~-8e-9: cached rollout equals full replay |
 | update activation memory, 16k positions at L = 416 | 5.0 GB saved for backward (grid 1.4 GB, attention-dominated trunk 3.5 GB) |
 | update peak driver memory | 17.9 GB at 16k-position microbatches; 9.4 GB at 8k (the preset) |
 
+Rollouts show low GPU utilization because a decode wave is ~200 small ops
+whose host dispatch cost exceeds the GPU work below ~1,700 rows. Two fixes
+are in: decode shapes are bucketed (MPS compiles a graph per shape and exact
+shapes change every wave: 1.5x faster rollouts), and transfers are
+non-blocking (on MPS a blocking copy waits for all queued work). Overlapping
+two cohorts measured slower while dispatch-bound. The remaining levers are
+more games per update (rollout time grows sublinearly) and fewer ops per wave
+(a fused decode, as plump's Metal trunk does).
+
 Attention activations grow with stream length, so Rummy needs half plump's
-microbatch. Long streams also leave length buckets of one or two sequences;
-`[ppo] min_group_sequences = 32` merges them upward, because MPS autograd at
-a few hundred rows has returned garbage gradients (the first run diverged on
-its first update). The trainer now also skips any non-finite step.
+microbatch, and `[ppo] min_group_sequences = 32` merges the long tail of
+one- or two-stream length buckets. The first runs hit NaN policy gradients:
+the card grid's op-by-op RMSNorm backward, rerun from MPS's graph cache at the
+policy head's few hundred decision rows, returned all-NaN input gradients in
+about 1 of 4 passes. The grid now uses `F.rms_norm` (0 failures in 72
+passes; gradients within bf16 accuracy of a CPU fp32 reference), and the
+trainer skips any non-finite step as a safety net.
+
+First run (`r3`, preset as committed): after 100 iterations (75 minutes),
+rounds with a winner rose from 16% to ~75%, rounds shortened from 120 to 57
+turns, discard takes fell from 50% to 22%. Against the heuristic the policy
+improved from -120 to -42 points per seat (relative reward, both directions);
+against random play it scores +81.
 
 ## Status and next steps
 
