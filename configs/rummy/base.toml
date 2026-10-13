@@ -43,9 +43,12 @@ actor_value_coef = 0.2
 auxiliary_grad_fraction = 0.25
 entropy_mode = "adaptive"
 entropy_targets = { draw = 0.15, play = 0.15 }
+# Streams reach ~400 tokens, where attention dominates activation memory:
+# 8192 positions peak at ~9.4 GB (16384 reached 17.9 GB).
 microbatch_positions = 8192
 sequence_bucket_width = 32
 critic_sequence_bucket_width = 32
+min_group_sequences = 32
 
 [game]
 player_counts = [2, 3, 4]

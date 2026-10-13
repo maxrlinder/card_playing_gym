@@ -300,6 +300,7 @@ def _iteration(components, rng: random.Random, iteration: int) -> dict[str, floa
         critic_bucket_width=config.ppo.critic_sequence_bucket_width,
         max_length=game.max_length,
         critic_max_length=game.critic_max_length,
+        min_group_sequences=config.ppo.min_group_sequences,
     )
     built = time.perf_counter()
     stats = trainer.update(batch, iteration)
@@ -334,6 +335,7 @@ def _log_line(row: dict[str, float], game) -> str:
         f"| entropy {heads} | clip {row.get('clip_fraction', 0.0):.3f} "
         f"| V rmse {row.get('value_rmse', 0.0):.2f}"
         + (f" | {summary}" if summary else "")
+        + (" | SKIPPED non-finite step" if row.get("skipped_actor_steps") or row.get("skipped_critic_steps") else "")
     )
 
 

@@ -96,6 +96,9 @@ class PPOConfig:
     # into one batch (0 = exact lengths). Causality makes this exact.
     sequence_bucket_width: int = 16
     critic_sequence_bucket_width: int = 32
+    # Merge length buckets until each holds this many sequences (0 = off):
+    # long streams otherwise leave groups of one or two sequences.
+    min_group_sequences: int = 0
 
     def validate(self) -> None:
         if self.learning_rate <= 0 or self.critic_learning_rate <= 0:

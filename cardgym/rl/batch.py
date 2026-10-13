@@ -115,6 +115,7 @@ def build_batch(
     critic_bucket_width: int,
     max_length: int,
     critic_max_length: int,
+    min_group_sequences: int = 0,
 ) -> PPOBatch:
     games = len(trajectories)
     if games == 0:
@@ -137,10 +138,10 @@ def build_batch(
         critic_entries.append((derived.critic, game_weight, players, absolute))
 
     actor_groups, actor_address = _stack(
-        actor_entries, actor_labels, bucket_width, max_length
+        actor_entries, actor_labels, bucket_width, max_length, min_group_sequences
     )
     critic_groups, critic_address = _stack(
-        critic_entries, critic_labels, critic_bucket_width, critic_max_length
+        critic_entries, critic_labels, critic_bucket_width, critic_max_length, min_group_sequences
     )
 
     columns: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
@@ -189,10 +190,12 @@ def _stack(
     specs: dict[str, LabelSpec],
     width: int,
     capacity: int,
+    min_sequences: int = 0,
 ) -> tuple[list[SequenceGroup], list[tuple[int, int]]]:
     buckets: dict[int, list[int]] = defaultdict(list)
     for index, (sequence, _, _, _) in enumerate(entries):
         buckets[bucket_length(sequence.tokens.shape[0], width, capacity)].append(index)
+    buckets = merge_small_buckets(buckets, min_sequences)
     groups: list[SequenceGroup] = []
     address: list[tuple[int, int]] = [(-1, -1)] * len(entries)
     for length, members in sorted(buckets.items()):
@@ -234,6 +237,33 @@ def _stack(
             )
         )
     return groups, address
+
+
+def merge_small_buckets(buckets: dict[int, list[int]], minimum: int) -> dict[int, list[int]]:
+    """Fold length buckets holding fewer than ``minimum`` sequences into longer ones.
+
+    A handful of long streams makes a tiny group, hence tiny microbatches:
+    slow, and on MPS small autograd batches have returned garbage gradients.
+    Shorter streams may be padded up to a longer bucket (causal attention
+    keeps that exact), never the reverse, so this walks from the longest.
+    """
+
+    if minimum <= 1 or not buckets:
+        return dict(buckets)
+    merged: dict[int, list[int]] = {}
+    lengths = sorted(buckets, reverse=True)
+    carry_length, carry = lengths[0], list(buckets[lengths[0]])
+    for length in lengths[1:]:
+        if len(carry) < minimum:
+            carry.extend(buckets[length])  # padded up to carry_length
+        else:
+            merged[carry_length] = carry
+            carry_length, carry = length, list(buckets[length])
+    if len(carry) < minimum and merged:
+        merged[min(merged)].extend(carry)  # the shortest leftovers join the next longer group
+    else:
+        merged[carry_length] = carry
+    return merged
 
 
 def _decision_rows(column: dict[str, list], features: list) -> DecisionRows:
@@ -288,6 +318,10 @@ class RowIndex:
 
 
 def microbatches(group: SequenceGroup, positions: int) -> list[tuple[int, int]]:
-    rows = max(positions // max(group.length, 1), 1)
+    """Near-equal row ranges of at most ``positions`` tokens (no tiny remainder)."""
+
+    limit = max(positions // max(group.length, 1), 1)
     count = group.tokens.shape[0]
-    return [(start, min(start + rows, count)) for start in range(0, count, rows)]
+    chunks = -(-count // limit)
+    bounds = [count * index // chunks for index in range(chunks + 1)]
+    return list(zip(bounds[:-1], bounds[1:]))

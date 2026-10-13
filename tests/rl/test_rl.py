@@ -138,3 +138,24 @@ def test_batch_weights_give_every_game_equal_mass(collected):
     for head, rows in batch.decisions.items():
         assert (rows.probs[np.arange(len(rows)), rows.action] > 0).all(), head
         np.testing.assert_allclose(rows.probs.sum(1), 1.0, rtol=1e-5)
+
+
+def test_small_buckets_merge_upward_and_microbatches_balance():
+    from cardgym.rl.batch import merge_small_buckets, microbatches
+
+    buckets = {32: list(range(40)), 64: [40, 41], 96: [42], 128: [43, 44]}
+    merged = merge_small_buckets(buckets, 4)
+    # The three long buckets fold into the longest; nothing is ever truncated.
+    assert merged == {128: [43, 44, 42, 40, 41], 32: list(range(40))}
+    assert merge_small_buckets({32: [0], 64: list(range(1, 9))}, 4) == {64: list(range(1, 9)) + [0]}
+    assert merge_small_buckets(buckets, 0) == buckets
+
+    class Group:
+        def __init__(self, rows, length):
+            self.tokens = np.zeros((rows, length, 1))
+            self.length = length
+
+    assert microbatches(Group(20, 400), 7600) == [(0, 10), (10, 20)]
+    assert microbatches(Group(5, 10), 1000) == [(0, 5)]
+    spans = microbatches(Group(101, 64), 640)
+    assert max(b - a for a, b in spans) <= 10 and min(b - a for a, b in spans) >= 9

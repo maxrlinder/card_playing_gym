@@ -103,7 +103,7 @@ def evaluate(
         for _ in range(deals):
             deal_seed = rng.getrandbits(48)
             for lone in range(players):
-                for direction in ("model_alone", "opponent_alone"):
+                for direction in _directions(players):
                     seats = frozenset([lone]) if direction == "model_alone" else frozenset(range(players)) - {lone}
                     policy = HeuristicPolicy() if opponent == "heuristic" else RandomPolicy(deal_seed ^ lone)
                     inner = RummySelfPlay(
@@ -130,11 +130,16 @@ def evaluate(
     return report(finished, player_counts)
 
 
+def _directions(players: int) -> tuple[str, ...]:
+    # Heads-up, "one model seat" and "one opponent seat" are the same games.
+    return ("model_alone",) if players == 2 else ("model_alone", "opponent_alone")
+
+
 def report(finished, player_counts: tuple[int, ...]) -> dict:
     result: dict = {"by_players": {}}
     for players in player_counts:
         entry = {}
-        for direction in ("model_alone", "opponent_alone"):
+        for direction in _directions(players):
             rewards, wins, model_wins, lengths, truncated = [], 0, 0, [], 0
             for count, kind, seats, returns, inner in finished:
                 if count != players or kind != direction:
@@ -156,7 +161,7 @@ def report(finished, player_counts: tuple[int, ...]) -> dict:
                 "truncated": truncated / n,
             }
         entry["both_directions"] = float(
-            np.mean([entry[d]["model_relative_reward"] for d in ("model_alone", "opponent_alone")])
+            np.mean([entry[d]["model_relative_reward"] for d in _directions(players)])
         )
         result["by_players"][str(players)] = entry
     result["model_relative_reward"] = float(
@@ -182,12 +187,15 @@ def evaluate_command(args: argparse.Namespace) -> int:
     print(f"{args.model} (iteration {iteration}) vs {args.opponent}: "
           f"relative reward {result['model_relative_reward']:+.2f} points per seat")
     for count, entry in result["by_players"].items():
-        alone, crowd = entry["model_alone"], entry["opponent_alone"]
-        print(
+        alone = entry["model_alone"]
+        line = (
             f"  {count}p: model alone {alone['model_relative_reward']:+7.2f} +- {alone['stderr']:.2f}"
-            f" (wins {alone['model_win_share']:.2f})   opponent alone {crowd['model_relative_reward']:+7.2f}"
-            f" +- {crowd['stderr']:.2f}   events/game {alone['events_per_game']:.0f}"
+            f" (wins {alone['model_win_share']:.2f})"
         )
+        crowd = entry.get("opponent_alone")
+        if crowd is not None:
+            line += f"   opponent alone {crowd['model_relative_reward']:+7.2f} +- {crowd['stderr']:.2f}"
+        print(line + f"   events/game {alone['events_per_game']:.0f}")
     if args.output:
         atomic_write_json(args.output, result)
     return 0

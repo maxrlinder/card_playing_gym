@@ -8,7 +8,7 @@ privileged critic, run management, and a CLI.
 | Game | Status |
 | --- | --- |
 | `plump` | Trained. The `rl-v6` model (8.5M parameters, iteration 71k) ships in `checkpoints/plump/rl-v6`. |
-| `rummy` | Next: see [Adding a game](docs/adding-a-game.md). |
+| `rummy` | Implemented: engine, card-ledger tokens, card-grid model, candidate heads ([Rummy](docs/rummy.md)). First runs in progress. |
 
 ## Quick start
 
@@ -35,6 +35,7 @@ production preset, which continues the published model:
 
 ```bash
 uv run cardgym plump train smoke --config configs/plump/smoke.toml
+uv run cardgym rummy train smoke --config configs/rummy/smoke.toml
 
 CARDGYM_METAL_TRUNK=1 uv run cardgym plump train rl-v7 \
   --config configs/plump/rl-v6.toml --init-from checkpoints/plump/rl-v6
@@ -56,6 +57,8 @@ cardgym <game> export RUN --out DIR       publish actor/critic weights as a rele
 cardgym plump evaluate MODEL [--opponent heuristic|MODEL] [--deals N] [--mode argmax|sample]
 cardgym plump play [MODEL]
 cardgym plump import-legacy CHECKPOINT --out DIR    convert a plump-bot checkpoint
+cardgym rummy evaluate MODEL [--opponent heuristic|random] [--players 2,3,4] [--deals N]
+cardgym rummy simulate [--policy heuristic|random]   rule-based statistics, no model
 ```
 
 ## Layout
@@ -67,9 +70,11 @@ cardgym/rl/           self-play collector, batches, PPO trainer, checkpoints, ru
 cardgym/games/base.py the contract a game implements
 cardgym/games/plump/  engine, heuristic, tokens, labels, model, training hooks,
                       evaluation, browser GUI, legacy import
+cardgym/games/rummy/  engine and meld search, ledger tokens, card-grid model,
+                      candidate heads, training hooks, evaluation
 configs/<game>/       presets
 checkpoints/<game>/   published releases (actor.pt, critic.pt, info.json)
-tests/                engine, trunk, PPO, plump streams, release regression, CLI
+tests/                engine, trunk, PPO, plump and rummy streams, release regression, CLI
 ```
 
 Run artifacts go to `runs/<game>/<run>/` (git-ignored; `CARDGYM_RUNS_DIR`
@@ -79,7 +84,8 @@ relocates them).
 
 - [Architecture](docs/architecture.md): how self-play, batching, PPO, and runs fit together.
 - [Plump](docs/plump.md): rules, token schema, model, auxiliary heads, and the rl-v6 lineage.
-- [Adding a game](docs/adding-a-game.md): the contract, with notes for Rummy.
+- [Rummy](docs/rummy.md): the state-representation design (card ledger, card grid, candidate heads).
+- [Adding a game](docs/adding-a-game.md): the contract a game implements.
 
 ## Requirements
 

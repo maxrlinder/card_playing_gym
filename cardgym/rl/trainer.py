@@ -186,7 +186,7 @@ class PPOTrainer:
 
     def update(self, batch: PPOBatch, iteration: int) -> dict[str, float]:
         started = time.perf_counter()
-        stats: dict[str, float] = {}
+        stats: dict[str, float] = {"skipped_actor_steps": 0.0}
         totals: Totals = defaultdict(list)
         stats.update(self._prepare_advantages(batch))
         stats["policy_rows"] = float(sum(len(rows) for rows in batch.decisions.values()))
@@ -207,9 +207,14 @@ class PPOTrainer:
                 torch.nn.utils.clip_grad_norm_(self.actor_parameters, self.config.max_grad_norm)
             )
             self._set_learning_rate(iteration)
-            standardize_grads(self.actor_parameters)
-            self.actor_optimizer.step()
-            self.optimizer_steps += 1
+            if math.isfinite(grad_norm):
+                standardize_grads(self.actor_parameters)
+                self.actor_optimizer.step()
+                self.optimizer_steps += 1
+            else:
+                # A non-finite gradient must never reach the weights or Adam's moments.
+                self.actor_optimizer.zero_grad(set_to_none=True)
+                stats["skipped_actor_steps"] += 1.0
             observed = {
                 head: reduced.get(f"entropy_{head}", 0.0) / reduced[f"entropy_weight_{head}"]
                 for head in self.policy_heads
@@ -537,6 +542,7 @@ class PPOTrainer:
         epoch_losses: list[float] = []
         totals: Totals = defaultdict(list)
         grad_norm = 0.0
+        skipped = 0
         for epoch in range(self.config.critic_epochs):
             self.critic.train()
             self.critic_optimizer.zero_grad(set_to_none=True)
@@ -558,12 +564,17 @@ class PPOTrainer:
             grad_norm = float(
                 torch.nn.utils.clip_grad_norm_(self.critic_parameters, self.config.max_grad_norm)
             )
-            standardize_grads(self.critic_parameters)
-            self.critic_optimizer.step()
+            if math.isfinite(grad_norm):
+                standardize_grads(self.critic_parameters)
+                self.critic_optimizer.step()
+            else:
+                self.critic_optimizer.zero_grad(set_to_none=True)
+                skipped += 1
             epoch_losses.append(math.fsum(float(value) for value in pending))
         reduced = {key: math.fsum(float(v) for v in values) for key, values in totals.items()}
         stats = {
             "critic_grad_norm": grad_norm,
+            "skipped_critic_steps": float(skipped),
             "loss_critic_value": reduced.get("critic_value_loss", 0.0) / self.config.critic_epochs,
             "critic_loss_first_epoch": epoch_losses[0],
             "critic_loss_last_epoch": epoch_losses[-1],

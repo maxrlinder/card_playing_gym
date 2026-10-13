@@ -47,8 +47,9 @@ loop. Each observer of each game owns one KV-cache row with its own length:
 1. **Prefill.** Every observer's prefix is encoded; rows with equal prefix
    lengths share one forward.
 2. **Wave.** Every live game makes one decision. The actor's logits come from
-   its row's last hidden state; actions are sampled from the masked softmax
-   with the game's own RNG, and recorded with the full behavior distribution.
+   its row's last hidden state (and, for heads that want raw fields, its
+   last token); actions are sampled from the masked softmax with the game's
+   own RNG, and recorded with the full behavior distribution.
 3. **Append.** `game.step(action)` returns each observer's new tokens. Rows
    are padded to the wave's longest run and decoded in one ragged forward.
    Each row writes at its own offset and attends only to its own prefix. A
@@ -118,7 +119,11 @@ rise means rollout and training disagree about the inputs.
   (`cardgym/nn/metal_trunk.py`) for sequences up to 128 tokens. It halved
   plump's iteration time and matches autocast within bf16 rounding.
 * `microbatch_positions` is the update's memory lever; it does not change the
-  accumulated loss.
+  accumulated loss. Attention activations grow with stream length, so long
+  streams (Rummy's reach 400 tokens) need smaller microbatches.
+* Gradients are given their parameter's layout before each optimizer step:
+  fused MPS Adam rejects mismatched strides, which MPS Conv1d backward
+  produces.
 * Each iteration runs inside an Objective-C autorelease pool, and
   `--recycle-after` bounds the remaining MPS native-heap growth.
 
