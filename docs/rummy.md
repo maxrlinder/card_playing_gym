@@ -44,11 +44,11 @@ cards also arrive, so item 1 and 2 must be handed to the model directly.
 
 There are three places a per-position state can go:
 
-| Placement | Extra tokens | Extra work per position | Problem |
+| Placement | Extra tokens | Extra work per token (base preset) | Problem |
 | --- | --- | --- | --- |
-| state as tokens (one per card) | ~50 per event | attention over ~50x longer streams | sequence length explodes |
-| cross-attention to a state memory at every layer | none | K/V projections of ~50 items in every layer, ~10x the trunk | nothing is amortized; the memory is rebuilt per position |
-| **state in the token's own embedding** | **none** | **one card-grid pass per token, before the trunk** | **must not lose information (below)** |
+| state as tokens (one per card) | 30-75 per event | attention over 30-75x longer streams | sequence length explodes |
+| cross-attention to the visible cards at every layer | none | K/V projections of every item in every layer: 1.3-4x the whole trunk for 30-75 cards | nothing is amortized; every position and layer re-projects its own memory |
+| **state in the token's own embedding** | **none** | **one card-grid pass before the trunk: ~0.3x the trunk** | **must not lose information (below)** |
 
 Two misconceptions are worth stating:
 
@@ -168,3 +168,41 @@ heuristic seat against P - 1 model seats, rotating the lone seat), through
 the batched collector. `cardgym rummy simulate` prints rule-based statistics.
 The heuristic (`heuristic.py`) takes a discard that makes a new meld, melds
 and lays off at once, and discards its least connected, highest-value card.
+
+## Measured (M5 Pro, base preset)
+
+| | |
+| --- | --- |
+| engine + tokens, Python | ~33 us per decision (`simulate`: 25-60 us per event incl. all ledgers) |
+| stream length, untrained policy | ~250 events (stock-outs); heuristic play ~60-80 |
+| decode wave, 864 rows at span 300 | 34 ms GPU forward (card grid 6 ms, trunk 28 ms) + 2.5 ms per policy head |
+| `behavior_kl` (bf16 compute, fp16 KV cache) | -8e-9: cached rollout equals full replay |
+| update activation memory, 16k positions at L = 416 | 5.0 GB saved for backward (grid 1.4 GB, attention-dominated trunk 3.5 GB) |
+| update peak driver memory | 17.9 GB at 16k-position microbatches; 9.4 GB at 8k (the preset) |
+
+Attention activations grow with stream length, so Rummy needs half plump's
+microbatch. Long streams also leave length buckets of one or two sequences;
+`[ppo] min_group_sequences = 32` merges them upward, because MPS autograd at
+a few hundred rows has returned garbage gradients (the first run diverged on
+its first update). The trainer now also skips any non-finite step.
+
+## Status and next steps
+
+The pipeline is complete and tested (`tests/rummy`: meld search against brute
+force, engine invariants, ledger privacy against an independent replay,
+cached rollout against full replay, end-to-end CLI). Everything about the
+recipe is a starting point:
+
+* **Schedule.** Early from-scratch learning is limited by optimizer steps per
+  hour; the preset trades batch size (144 games) for two PPO epochs and a
+  short warmup. Collection time is set by the longest game (one wave per
+  event), so it falls as play improves.
+* **Size.** d_model 256, 8 layers, card grid 2 x 32 wide. The fused Metal
+  trunk covers streams of at most 128 tokens, so Rummy runs the PyTorch path.
+* **Advantages.** Monte Carlo over ~30-100 decisions per seat; GAE
+  (`advantage_estimator = "gae"`) is the first variance lever to try.
+* **Beliefs.** `hands` is linear in the readout; a card-conditioned readout
+  (hidden x per-card grid features) is the natural upgrade.
+* **Symmetry.** Suit permutation is an exact symmetry of the rules; the grid
+  respects it, the per-card summary and event-card rows do not. Random suit
+  relabelling per game is free augmentation.

@@ -187,3 +187,20 @@ def test_cached_rollout_matches_full_replay():
                     probs = masked_probabilities(logits.numpy(), np.ones_like(logits.numpy(), dtype=bool))[0]
                     worst = max(worst, float(np.abs(probs - decision.probs).max()))
     assert worst < 1e-5
+
+
+def test_card_grid_is_suit_equivariant():
+    """Relabelling suits in the ledger relabels the per-card features the same way."""
+
+    torch.manual_seed(0)
+    grid = randomize(tiny_game().build_actor(), seed=1, scale=0.1).embedding.grid.eval()
+    ledger = torch.randint(0, 144, (6, NUM_CARDS))
+    permutation = torch.tensor([2, 0, 3, 1])  # new suit of each old suit
+    cards = torch.arange(NUM_CARDS)
+    moved = permutation[cards // 13] * 13 + cards % 13
+    relabelled = torch.empty_like(ledger)
+    relabelled[:, moved] = ledger
+    with torch.no_grad():
+        original = grid.cards(ledger)
+        permuted = grid.cards(relabelled)
+    assert torch.allclose(permuted[:, moved], original, atol=1e-5)

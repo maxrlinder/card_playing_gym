@@ -31,8 +31,10 @@ score_dim = 64
 
 [ppo]
 learning_rate = 3e-4
-lr_warmup_updates = 50
+lr_warmup_updates = 10
 clip_ratio = 0.2
+# From scratch, optimizer steps per hour are what limit early learning.
+epochs = 2
 max_grad_norm = 1.0
 advantage_estimator = "monte_carlo"
 critic_learning_rate = 3e-4
@@ -53,7 +55,7 @@ min_group_sequences = 32
 [game]
 player_counts = [2, 3, 4]
 hand_sizes = [13]
-games_per_shape = 96
+games_per_shape = 48
 opening_points = 30
 max_turns = 200
 
