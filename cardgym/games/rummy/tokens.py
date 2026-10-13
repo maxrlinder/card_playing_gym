@@ -47,6 +47,8 @@ from .engine import (
 )
 from .melds import MELD_CARDS, MELD_KIND
 
+MELD_SIZES = [len(cards) for cards in MELD_CARDS]
+
 F_PHASE = 0  # the decision: draw (0) or play (1)
 F_LAST_KIND = 1  # the viewer's previous event kind (0: none yet)
 F_LAST_CARD = 2  # its card: drawn, taken, laid off, or discarded
@@ -143,63 +145,63 @@ class ObservationWriter:
         self.last[actor] = event
 
     def observe(self, seat: int) -> tuple[np.ndarray, np.ndarray]:
-        """Seat ``seat``'s actor token and oracle token now; both [WIDTH] int16."""
+        """Seat ``seat``'s actor token and oracle token now; both [WIDTH] int16.
+
+        Fields are assembled as Python ints (one numpy write per token rather
+        than one per field: this runs once per decision on the rollout's host
+        path) and the two ledgers as one [2, 52] computation.
+        """
 
         engine = self.engine
         players = self.players
-        rows = np.zeros((2, WIDTH), dtype=np.int64)  # actor, oracle
-        rows[:, F_PHASE] = int(engine.phase == PLAY)
-        rows[:, F_LAST_CARD] = NO_CARD
-        rows[:, F_LAST_MELD_KIND] = NO_MELD_KIND
         last = self.last[seat]
-        if last is not None:
-            rows[:, F_LAST_KIND] = last.kind
-            rows[:, F_LAST_CARD] = last.card
-            if last.meld >= 0:
-                rows[:, F_LAST_MELD_KIND] = MELD_KIND[last.meld]
-                rows[:, F_LAST_MELD_SIZE] = len(MELD_CARDS[last.meld])
+        if last is None:
+            head = [int(engine.phase == PLAY), 0, NO_CARD, NO_MELD_KIND, 0]
+        elif last.meld >= 0:
+            head = [int(engine.phase == PLAY), last.kind, last.card, MELD_KIND[last.meld], MELD_SIZES[last.meld]]
+        else:
+            head = [int(engine.phase == PLAY), last.kind, last.card, NO_MELD_KIND, 0]
         since = self.token_event[seat]
+        draws, taken, seen_taken, discards = [], [], [], []
         for offset in range(1, MAX_PLAYERS):
-            draw_field, take_field, discard_field = (
-                F_OPP_DRAW + offset - 1, F_OPP_TAKE + offset - 1, F_OPP_DISCARD + offset - 1,
-            )
-            rows[:, take_field] = NO_CARD
-            rows[:, discard_field] = NO_CARD
             if offset >= players:
-                rows[:, draw_field] = DRAW_ABSENT
+                draws.append(DRAW_ABSENT)
+                taken.append(NO_CARD)
+                seen_taken.append(NO_CARD)
+                discards.append(NO_CARD)
                 continue
             opponent = (seat + offset) % players
             at, kind, card = self.drawn[opponent]
             if at > since:
-                rows[:, draw_field] = kind
-                rows[1, take_field] = card
-                if kind == DRAW_TAKE:
-                    rows[0, take_field] = card
+                draws.append(kind)
+                taken.append(card)
+                seen_taken.append(card if kind == DRAW_TAKE else NO_CARD)
+            else:
+                draws.append(DRAW_NONE)
+                taken.append(NO_CARD)
+                seen_taken.append(NO_CARD)
             at, card = self.discarded[opponent]
-            if at > since:
-                rows[:, discard_field] = card
-        rows[:, F_STOCK] = len(engine.stock)
-        sizes = engine.hands.sum(axis=1)
-        hand = np.full(MAX_PLAYERS, ABSENT_SEAT, dtype=np.int64)
-        hand[self.relative[seat]] = sizes
-        rows[:, F_HAND : F_HAND + MAX_PLAYERS] = hand
-        opened = np.array(engine.opened, dtype=np.int64)
-        rows[:, F_OPENED] = int((opened << self.relative[seat]).sum())
-        rows[:, F_PROGRESS] = min(engine.turn_points, FIELD_VOCAB[F_PROGRESS] - 1)
-        rows[:, F_PLAYERS] = players
-        rows[:, F_ROUND] = min(engine.turns // players, MAX_ROUND)
-        rows[0, F_STOCK_TOP] = NO_CARD
-        rows[1, F_STOCK_TOP] = engine.stock[-1] if engine.stock else NO_CARD
-        layable = engine.layable.astype(np.int64)
-        own = self.pairs[seat]
-        changed = own != self.reference[seat]
-        mover = np.where(changed, 1 + (self.mover[seat] - seat) % players, 0)
-        rows[0, LEDGER_START:] = own + NUM_PAIRS * (mover + NUM_MOVERS * layable)
-        oracle = self.pairs[players]
-        changed = oracle != self.oracle_reference[seat]
-        mover = np.where(changed, 1 + (self.mover[players] - seat) % players, 0)
-        rows[1, LEDGER_START:] = ROTATE[players][seat][oracle] + NUM_PAIRS * (mover + NUM_MOVERS * layable)
-        self.reference[seat] = own
-        self.oracle_reference[seat] = oracle
+            discards.append(card if at > since else NO_CARD)
+        sizes = engine.hands.sum(axis=1).tolist()
+        hand = [sizes[(seat + j) % players] if j < players else ABSENT_SEAT for j in range(MAX_PLAYERS)]
+        opened = sum(1 << j for j in range(players) if engine.opened[(seat + j) % players])
+        tail = [
+            len(engine.stock), *hand, opened, min(engine.turn_points, FIELD_VOCAB[F_PROGRESS] - 1),
+            players, min(engine.turns // players, MAX_ROUND),
+        ]
+        stock_top = engine.stock[-1] if engine.stock else NO_CARD
+        rows = np.empty((2, WIDTH), dtype=np.int64)
+        rows[0, :NUM_FIELDS] = head + draws + seen_taken + discards + tail + [NO_CARD]
+        rows[1, :NUM_FIELDS] = head + draws + taken + discards + tail + [stock_top]
+        views = [seat, players]
+        pairs = self.pairs[views]
+        reference = np.stack((self.reference[seat], self.oracle_reference[seat]))
+        mover = np.where(pairs != reference, 1 + (self.mover[views] - seat) % players, 0)
+        located = pairs.copy()
+        located[1] = ROTATE[players][seat][pairs[1]]
+        rows[:, LEDGER_START:] = located + NUM_PAIRS * (mover + NUM_MOVERS * engine.layable)
+        self.reference[seat] = pairs[0]
+        self.oracle_reference[seat] = pairs[1]
         self.token_event[seat] = self.events
-        return rows[0].astype(np.int16), rows[1].astype(np.int16)
+        tokens = rows.astype(np.int16)
+        return tokens[0], tokens[1]

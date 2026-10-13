@@ -348,7 +348,7 @@ def _wgrad(dy: torch.Tensor, x: torch.Tensor, splits: int = 8) -> torch.Tensor:
 
 
 class FusedCardGrid(torch.autograd.Function):
-    """ledger [rows, 52] int64 -> per-card features [rows, 52, W] fp32.
+    """ledger [rows, 52] int64 -> per-card features [rows, 52, W] bf16.
 
     ``params``: code embedding, rank embedding, then per block (norm gain,
     conv weight, conv bias, across weight, out weight, out bias), then the
@@ -359,6 +359,7 @@ class FusedCardGrid(torch.autograd.Function):
     def forward(ctx, grid, ledger, *params):
         lib = _library(grid.width, grid.hidden)
         code_w, rank_w = params[0], params[1]
+        # Convolution weights and biases enter through grid.blocks[i].gemm_operands.
         blocks = [params[2 + 6 * b : 8 + 6 * b] for b in range(len(grid.blocks))]
         final_gain = params[-1]
         rows = ledger.shape[0]
@@ -374,27 +375,25 @@ class FusedCardGrid(torch.autograd.Function):
         )
         saved, circulants = [], []
         cards_out = None
-        for index, (_, conv_w, conv_b, wa, wo, bo) in enumerate(blocks):
-            circulant = grid.blocks[index].circulant(conv_w).to(torch.bfloat16)
-            along = F.linear(
-                y.view(rows * 4, 13 * width), circulant.t(), conv_b.to(torch.bfloat16).repeat(13)
-            ).view(cards, hidden)
+        for index, (_, _, _, wa, wo, bo) in enumerate(blocks):
+            circulant, bias = grid.blocks[index].gemm_operands(torch.bfloat16)
+            along = F.linear(y.view(rows * 4, 13 * width), circulant.t(), bias).view(cards, hidden)
             last = index == len(blocks) - 1
             next_gain = final_gain if last else blocks[index + 1][0]
             x_out = torch.empty_like(x)
             rstd_out = torch.empty_like(rstd)
-            if last:
-                cards_out = torch.empty(cards, width, device=dev)
-                y_bf, y_f = y, cards_out  # y_bf is not written
-            else:
-                y_bf, y_f = torch.empty_like(y), x  # y_f is not written
+            # The final norm's output is the cards in bf16: every consumer is a
+            # bf16 GEMM under autocast, which would round them the same way.
+            y_out = torch.empty_like(y)
             lib.grid_tail(
-                along, y, x, wa, wo, bo, next_gain, x_out, y_bf, y_f, rstd_out, rows, int(last), eps,
+                along, y, x, wa, wo, bo, next_gain, x_out, y_out, x, rstd_out, rows, 0, eps,
                 threads=min(rows, 4096) * _TAIL_THREADS, group_size=_TAIL_THREADS,
             )
             saved.append((x, y, rstd, along))
             circulants.append(circulant)
-            x, rstd, y = x_out, rstd_out, y_bf
+            x, rstd, y = x_out, rstd_out, y_out
+            if last:
+                cards_out = y_out
         ctx.grid = grid
         ctx.save_for_backward(ledger, *params)
         ctx.blocks_saved = saved

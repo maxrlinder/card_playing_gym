@@ -137,6 +137,8 @@ class GridBlock(nn.Module):
         self.register_buffer("shifts", shifts, persistent=False)
         self.register_buffer("pool", torch.full((1, NUM_SUITS), 1.0 / NUM_SUITS), persistent=False)
         self.register_buffer("spread", torch.ones(NUM_SUITS, 1), persistent=False)
+        self._operands_key: tuple | None = None
+        self._operands: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def circulant(self, weight: torch.Tensor | None = None) -> torch.Tensor:
         """The convolution as a [13 * width, 13 * hidden] matrix acting on one suit row."""
@@ -147,12 +149,33 @@ class GridBlock(nn.Module):
             NUM_RANKS * width, NUM_RANKS * hidden
         )
 
+    def gemm_operands(self, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        """(circulant [13 * width, 13 * hidden], bias repeated per rank) in ``dtype``, no autograd.
+
+        Cached until the weights change: an optimizer step or any in-place
+        write (fused MPS Adam does not bump version counters, hence the
+        global step count). Building them is a handful of ~0.2 ms MPS
+        dispatches, paid per rollout wave and microbatch otherwise.
+        """
+
+        from cardgym.nn.metal_trunk import optimizer_steps
+
+        weight, bias = self.along_rank.weight, self.along_rank.bias
+        key = (weight._version, bias._version, optimizer_steps(), weight.device, dtype)
+        if self._operands_key != key:
+            with torch.no_grad():
+                self._operands = (
+                    self.circulant(weight.detach()).to(dtype), bias.detach().to(dtype).repeat(NUM_RANKS)
+                )
+            self._operands_key = key
+        return self._operands
+
     def conv_grad(self, d_circulant: torch.Tensor) -> torch.Tensor:
         """The Conv1d weight gradient [hidden, width, kernel] from the circulant's gradient."""
 
         hidden, width, _ = self.along_rank.weight.shape
         shaped = d_circulant.reshape(NUM_RANKS, width, NUM_RANKS, hidden)
-        return torch.einsum("kio,iwoh->hwk", self.shifts.to(shaped.dtype), shaped)
+        return torch.einsum("kio,iwoh->hwk", self.shifts, shaped.float())
 
     def forward(self, grid: torch.Tensor) -> torch.Tensor:  # [N, suits, ranks, width]
         count, _, _, width = grid.shape

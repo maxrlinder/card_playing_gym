@@ -94,6 +94,14 @@ def _pair_rotations() -> dict[int, np.ndarray]:
 
 ROTATE = _pair_rotations()
 
+# A card type's copies over the locations as one number, sum_l count_l * 3^l
+# (counts are 0..2, so it is injective), and that number's pair code.
+LOCATION_WEIGHTS = 3 ** np.arange(NUM_LOCATIONS, dtype=np.int64)
+PAIR_OF_CODE = np.zeros(3**NUM_LOCATIONS, dtype=np.int64)
+for _a in range(NUM_LOCATIONS):
+    for _b in range(_a, NUM_LOCATIONS):
+        PAIR_OF_CODE[LOCATION_WEIGHTS[_a] + LOCATION_WEIGHTS[_b]] = PAIR[_a, _b]
+
 
 class Action(NamedTuple):
     kind: int
@@ -337,5 +345,4 @@ class RummyEngine:
     def view_pairs(self) -> np.ndarray:
         """Copy-location pair codes [P + 1, 52]: views 0..P-1 are the seats, view P the oracle."""
 
-        cumulative = self.location_counts().cumsum(axis=1)
-        return PAIR[(cumulative >= 1).argmax(axis=1), (cumulative >= 2).argmax(axis=1)]
+        return PAIR_OF_CODE[np.tensordot(LOCATION_WEIGHTS, self.location_counts(), axes=(0, 1))]

@@ -121,7 +121,9 @@ class ContinuousCollector:
     def in_flight(self) -> int:
         return sum(slot.state is not None for slot in self._slots)
 
-    @torch.inference_mode()
+    # no_grad rather than inference_mode: autocast does not cache its bf16
+    # weight casts under inference_mode (measured 3 casts per linear per call).
+    @torch.no_grad()
     def collect(self, lanes: list[Lane], rng: random.Random, *, version: int = 0) -> list[Trajectory]:
         started = time.perf_counter()
         self.stats = CollectionStats()
@@ -129,10 +131,14 @@ class ContinuousCollector:
         for slot in self._slots:
             if slot.state is None:
                 self._deal(slot, lanes, rng)
-        while not self._satisfied(lanes) and self.in_flight:
-            self._launch()
-            self._receive()
-            self._act(lanes, rng, version)
+        # One autocast context for the whole collection: autocast caches its
+        # bf16 copies of the weights until the outermost context exits, and on
+        # MPS each cast is a ~0.2 ms dispatch, paid per weight per wave otherwise.
+        with autocast_context(self.device, self.precision):
+            while not self._satisfied(lanes) and self.in_flight:
+                self._launch()
+                self._receive()
+                self._act(lanes, rng, version)
         results: list[Trajectory] = []
         for lane in lanes:
             bank = self._finished[lane.name]

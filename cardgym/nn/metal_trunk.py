@@ -689,6 +689,13 @@ _OPTIMIZER_STEPS = [0]
 _STEP_HOOK = None
 
 
+def optimizer_steps() -> int:
+    """Optimizer steps taken in this process (counting starts once a cache asks)."""
+
+    _count_optimizer_steps()
+    return _OPTIMIZER_STEPS[0]
+
+
 def _count_optimizer_steps() -> None:
     global _STEP_HOOK
     if _STEP_HOOK is None:
