@@ -8,7 +8,7 @@ privileged critic, run management, and a CLI.
 | Game | Status |
 | --- | --- |
 | `plump` | Trained. The `rl-v6` model (8.5M parameters, iteration 71k) ships in `checkpoints/plump/rl-v6`. |
-| `rummy` | Implemented: engine, card-ledger tokens, card-grid model, candidate heads ([Rummy](docs/rummy.md)). First runs in progress. |
+| `rummy` | Implemented: engine, per-decision card-ledger tokens, card-grid model, candidate heads, continuous asynchronous self-play, fused Metal kernels ([Rummy](docs/rummy.md)). |
 
 ## Quick start
 
@@ -65,8 +65,8 @@ cardgym rummy simulate [--policy heuristic|random]   rule-based statistics, no m
 
 ```text
 cardgym/core/         run directories, TOML config, metrics, dashboard, devices
-cardgym/nn/           GQA decoder trunk, KV cache, fused Metal trunk (MPS)
-cardgym/rl/           self-play collector, batches, PPO trainer, checkpoints, run loop
+cardgym/nn/           GQA decoder trunk, KV cache, fused Metal trunk (MPS, any length)
+cardgym/rl/           self-play collectors (batch, continuous, async), batches, PPO trainer, checkpoints, run loop
 cardgym/games/base.py the contract a game implements
 cardgym/games/plump/  engine, heuristic, tokens, labels, model, training hooks,
                       evaluation, browser GUI, legacy import

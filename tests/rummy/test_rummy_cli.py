@@ -42,3 +42,21 @@ def test_train_export_evaluate(runs_dir, tmp_path, capsys):
     assert set(result["by_players"]) == {"2", "3"}
     assert result["by_players"]["3"]["model_alone"]["games"] == 2 * 3
     assert "relative reward" in capsys.readouterr().out
+
+
+def test_asynchronous_rollout(runs_dir, tmp_path):
+    """The rollout process collects the next batch during the update: one more version of lag."""
+
+    config = tmp_path / "async.toml"
+    config.write_text(
+        (ROOT / "configs" / "rummy" / "smoke.toml").read_text().replace(
+            'mode = "continuous"\n', 'mode = "continuous"\nasynchronous = true\n'
+        )
+    )
+    assert main(["rummy", "train", "async", "--config", str(config), "--iterations", "3"]) == 0
+    with open(runs_dir / "rummy" / "async" / "metrics.csv", newline="") as handle:
+        history = list(csv.DictReader(handle))
+    assert [int(row["iteration"]) for row in history] == [1, 2, 3]
+    assert float(history[0]["policy_lag"]) == 0  # primed with the initial weights
+    assert all(float(row["policy_lag"]) >= 1 for row in history[1:])
+    assert all(float(row["rollout_sec"]) > 0 for row in history)

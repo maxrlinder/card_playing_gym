@@ -23,6 +23,7 @@ from cardgym.core.dashboard import DashboardRefresher, Panel
 from cardgym.core.devices import autorelease_pool
 from cardgym.core.metrics import MetricsLog
 from cardgym.core.runs import RunDirectory
+from cardgym.nn.metal_trunk import metal_trunk_requested
 
 from .batch import build_batch
 from .checkpoint import load_checkpoint, load_weights, restore_rng, save_checkpoint
@@ -252,9 +253,28 @@ def _train(
     )
     elapsed = metrics.last_value("elapsed_sec")
     first = iteration + 1
+    rollout = None
+    if config.rollout.asynchronous and first <= target:
+        from .async_rollout import RolloutProcess
+
+        rollout = RolloutProcess(
+            config.raw, trainer.actor, seed=config.run.seed * 1_000_003 + first, metal=metal_trunk_requested()
+        )
+        rollout.request(trainer.actor, version=first)
+        run.log("Rollout runs in its own process, overlapped with the update.")
+    try:
+        return _loop(run, components, rng, metrics, dashboard, save, args, rollout, first, target, elapsed)
+    finally:
+        if rollout is not None:
+            rollout.stop()
+
+
+def _loop(run, components, rng, metrics, dashboard, save, args, rollout, first, target, elapsed) -> int:
+    config = components.config
+    game = config.game
     for iteration in range(first, target + 1):
         with autorelease_pool():
-            row = _iteration(components, rng, iteration)
+            row = _iteration(components, rng, iteration, rollout, target)
             elapsed += row["iteration_sec"]
             row["elapsed_sec"] = elapsed
             metrics.append(row)
@@ -280,22 +300,37 @@ def _train(
     return 0
 
 
-def _iteration(components, rng: random.Random, iteration: int) -> dict[str, float]:
+def _iteration(components, rng: random.Random, iteration: int, rollout=None, target: int = 0) -> dict[str, float]:
     config = components.config
     game = config.game
     trainer = components.trainer
     collector = components.collector
     started = time.perf_counter()
     trainer.actor.eval()
-    if config.rollout.mode == "continuous":
-        trajectories = collector.collect(game.lanes(config.rollout.concurrency), rng, version=iteration)
+    if rollout is not None:
+        # Collected while the previous update ran; the next one starts now,
+        # with the weights from before this update.
+        received = rollout.receive()
+        if iteration < target:
+            rollout.request(trainer.actor, version=iteration)
+        trajectories, sequences, summary, collection = (
+            received.trajectories, received.sequences, received.summary, received.stats
+        )
+        versions = [record.version for t in trajectories for record in t.decisions]
+        collection.policy_lag = float(iteration - np.mean(versions)) if versions else 0.0
     else:
-        trajectories = collector.collect(game.new_games(rng, iteration))
-    collector.release()
+        if config.rollout.mode == "continuous":
+            trajectories = collector.collect(game.lanes(config.rollout.concurrency), rng, version=iteration)
+        else:
+            trajectories = collector.collect(game.new_games(rng, iteration))
+        collector.release()
+        sequences = [game.sequences(trajectory) for trajectory in trajectories]
+        summary = game.rollout_summary(trajectories)
+        collection = collector.stats
     collected = time.perf_counter()
     batch = build_batch(
         trajectories,
-        [game.sequences(trajectory) for trajectory in trajectories],
+        sequences,
         max_players=game.max_players,
         actor_labels=game.actor_labels,
         critic_labels=game.critic_labels,
@@ -308,10 +343,10 @@ def _iteration(components, rng: random.Random, iteration: int) -> dict[str, floa
     built = time.perf_counter()
     stats = trainer.update(batch, iteration)
     finished = time.perf_counter()
-    collection = collector.stats
     row: dict[str, float] = {
         "iteration": iteration,
         "iteration_sec": finished - started,
+        # Asynchronous: the time spent waiting for the rollout process.
         "collect_sec": collected - started,
         "build_sec": built - collected,
         "games": collection.games,
@@ -326,7 +361,9 @@ def _iteration(components, rng: random.Random, iteration: int) -> dict[str, floa
     if config.rollout.mode == "continuous":
         row["games_in_flight"] = collection.in_flight
         row["policy_lag"] = collection.policy_lag
-    row.update(game.rollout_summary(trajectories))
+    if rollout is not None:
+        row["rollout_sec"] = collection.collect_sec
+    row.update(summary)
     row.update(stats)
     return row
 

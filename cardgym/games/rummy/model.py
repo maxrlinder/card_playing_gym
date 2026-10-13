@@ -295,12 +295,12 @@ class RummyEmbedding(nn.Module):
         )
 
 
-def _card_sum(table: torch.Tensor, cards: torch.Tensor) -> torch.Tensor:
-    """Sum the rows of ``table`` [N, 52, D] named by ``cards`` [N, K, C]; NO_CARD adds nothing."""
+def _multi_hot(cards: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Copies of each card type named by ``cards`` [N, K, C] (NO_CARD counts nothing): [N, K, 52]."""
 
-    hot = torch.zeros(*cards.shape[:2], NUM_CARDS + 1, device=table.device, dtype=table.dtype)
-    hot.scatter_add_(2, cards, torch.ones_like(cards, dtype=table.dtype))
-    return hot[..., :NUM_CARDS] @ table
+    hot = torch.zeros(*cards.shape[:2], NUM_CARDS + 1, device=cards.device, dtype=dtype)
+    hot.scatter_add_(2, cards, torch.ones_like(cards, dtype=dtype))
+    return hot[..., :NUM_CARDS]
 
 
 class CandidateScorer(nn.Module):
@@ -330,11 +330,15 @@ class CandidateScorer(nn.Module):
     ) -> torch.Tensor:
         cards = cards.long()
         target = target.long()
-        moved_rows = self.card(grid) + self.card_id.weight.to(grid.dtype)
-        target_rows = self.target(grid) + self.target_id.weight.to(grid.dtype)
+        # Sum each candidate's cards first, then project: by linearity the
+        # same as projecting all 52 cards per row, at a fraction of the traffic.
+        moved = _multi_hot(cards, grid.dtype)
+        aimed = _multi_hot(target, grid.dtype)
         candidate = (
-            _card_sum(moved_rows, cards)
-            + _card_sum(target_rows, target)
+            self.card(moved @ grid)
+            + moved @ self.card_id.weight.to(grid.dtype)
+            + self.target(aimed @ grid)
+            + aimed @ self.target_id.weight.to(grid.dtype)
             + self.kind(kind.long())
             + self.size((cards != NO_CARD).sum(-1))
         )

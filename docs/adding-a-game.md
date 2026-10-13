@@ -34,6 +34,11 @@ fail):
 * `done()`, `returns()` (zero-sum per absolute seat), and `lifetime()`
   (expected remaining decisions, used to order games longest-first).
 
+For `[rollout] mode = "continuous"`, also implement `lanes(concurrency)`:
+one `Lane` per game kind with its seat count, its per-update quota, how many
+games to keep in flight, and a `deal(rng)` function. Prefixes may be empty
+for seats whose first token comes later.
+
 The streams the collector records are exactly what the model saw. Build
 training inputs from them rather than re-tokenizing, or test that the two
 agree (`tests/plump/test_plump_streams.py`).
@@ -44,10 +49,13 @@ Subclass `PolicyModel` and `CriticModel` (`cardgym/games/base.py`):
 
 * `embed(tokens)` returns `(sum of field embeddings, PLE lookup or None,
   value-embedding lookup or None)`. The trunk does the rest.
-* The actor implements `policy_logits(hidden, head, features, tokens)` and
-  `player_values(hidden)`, which is `[..., max_players]`, observer-relative.
-  `tokens` are the readout tokens themselves, so a head can read raw fields
-  (Rummy re-encodes the card ledger there to score candidates card by card).
+* The actor implements `policy_logits(hidden, head, features, tokens,
+  context)` and `player_values(hidden)`, which is `[..., max_players]`,
+  observer-relative. `tokens` are the readout tokens themselves, so a head can
+  read raw fields. `context` is the readouts' slice of whatever the model's
+  `pop_context()` handed over from its latest forward: Rummy keeps its
+  per-card grid features there, so the policy scores candidates card by card
+  without encoding the ledger twice.
 * The critic implements `player_values(hidden)` on whatever seat axis its
   stream uses. Absolute seats make value columns name seats directly.
 
@@ -55,9 +63,10 @@ Subclass `PolicyModel` and `CriticModel` (`cardgym/games/base.py`):
 
 `sequences(trajectory)` returns `GameSequences`:
 
-* one actor `TrainingSequence` per learning seat, plus one critic stream;
-* `critic_positions[i]`, the critic-stream position of decision `i`'s
-  pre-action state;
+* one actor `TrainingSequence` per learning seat, plus one critic stream
+  (absolute seats) or a dict of per-seat critic streams (seat-relative);
+* `critic_positions[i]`, the position of decision `i`'s pre-action state in
+  its critic stream (the acting seat's, for per-seat critics);
 * labels as numpy arrays, declared in `actor_labels` / `critic_labels` as
   `LabelSpec(per_position, fill, dtype)` so batching can pad them.
 

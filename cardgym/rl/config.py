@@ -45,6 +45,9 @@ class RolloutConfig:
     mode: Literal["batch", "continuous"] = "batch"
     # continuous: games in flight per lane, as a multiple of its per-update quota.
     concurrency: float = 1.0
+    # continuous: collect the next batch in a separate process while the
+    # update runs (one more version of policy lag; see rl/async_rollout.py).
+    asynchronous: bool = False
 
     def validate(self) -> None:
         if self.max_rows < 1:
@@ -55,6 +58,8 @@ class RolloutConfig:
             raise ValueError(f"Unknown [rollout] mode {self.mode!r}.")
         if self.concurrency <= 0:
             raise ValueError("[rollout] concurrency must be positive.")
+        if self.asynchronous and self.mode != "continuous":
+            raise ValueError("[rollout] asynchronous requires mode = \"continuous\".")
 
 
 @dataclass(frozen=True)

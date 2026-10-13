@@ -403,17 +403,23 @@ class PPOTrainer:
     ) -> torch.Tensor:
         seq = torch.from_numpy(rows.seq[selected] - start).to(self.device)
         pos = torch.from_numpy(rows.position[selected]).to(self.device)
+        # Candidate lists are padded to the batch's longest; trim them to this
+        # microbatch's longest (rows.probs is zero past each row's actions).
+        width = int(np.flatnonzero(rows.probs[selected].any(axis=0)).max()) + 1
         features = (
             None
             if rows.features is None
-            else {key: torch.from_numpy(value[selected]).to(self.device) for key, value in rows.features.items()}
+            else {
+                key: torch.from_numpy(np.ascontiguousarray(value[selected][:, :width])).to(self.device)
+                for key, value in rows.features.items()
+            }
         )
         with autocast_context(self.device, self.precision):
             logits = self.actor.policy_logits(
                 hidden[seq, pos], head, features, tokens[seq, pos], None if context is None else context[seq, pos]
             )
-        old_probs = torch.from_numpy(rows.probs[selected]).to(self.device)
-        logits = logits.float()[:, : old_probs.shape[1]]
+        old_probs = torch.from_numpy(np.ascontiguousarray(rows.probs[selected][:, :width])).to(self.device)
+        logits = logits.float()[:, :width]
         terms = ppo_terms(
             logits,
             old_probs,

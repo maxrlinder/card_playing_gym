@@ -6,15 +6,17 @@ its token schema, and its model heads ([Adding a game](adding-a-game.md));
 everything on this page is shared.
 
 ```text
-game.new_games()        one update's schedule of fresh deals
+game.new_games() / game.lanes()   one update's deals / game kinds kept in flight
    |
-SelfPlayCollector       KV-cached decoding of every game at once (cardgym/rl/selfplay.py)
+SelfPlayCollector                 KV-cached decoding of a whole schedule (rl/selfplay.py)
+  or ContinuousCollector          a refilled pool of games in flight (rl/continuous.py),
+                                  optionally in its own process (rl/async_rollout.py)
    |  Trajectory: each seat's token stream, decisions (behavior probs), returns
-game.sequences()        actor stream per seat + one critic stream, with labels
+game.sequences()                  actor stream per seat + critic stream(s), with labels
    |
-build_batch             bucketed groups, per-head decision rows, loss weights (rl/batch.py)
+build_batch                       bucketed groups, per-head decision rows, loss weights (rl/batch.py)
    |
-PPOTrainer.update       critic baseline -> advantages -> actor step -> critic epochs (rl/trainer.py)
+PPOTrainer.update                 critic baseline -> advantages -> actor step -> critic epochs (rl/trainer.py)
 ```
 
 ## Streams and the trunk
@@ -62,14 +64,38 @@ retire from the tail. Out-of-order retirement triggers a compaction that
 slides survivors down. Measured on plump, merging the 24 round shapes into
 one loop cut collection 2.9x versus one lockstep loop per shape.
 
+### Continuous collection
+
+`[rollout] mode = "continuous"` replaces the schedule with lanes
+(`game.lanes(concurrency)`): game kinds, each kept at `in_flight` games
+(`concurrency` x its per-update quota). A game that ends is replaced in the
+same wave, a wave decodes only the cache rows that received tokens (gathered
+by index, so a game whose only new token is the acting seat's costs one row),
+and `collect` returns as soon as every lane has finished its quota. Games
+still running carry over, cache rows included, and continue under the new
+weights. A collection costs about `quota * mean length / in_flight` waves
+instead of the longest game's length, and the decode shapes stay fixed.
+
+With `asynchronous = true` the collector runs in its own process and
+collects the next batch while the trainer updates on the current one: an
+iteration costs about max(collect, update). Weights travel through shared
+memory; the rollout process also builds each game's training sequences.
+
+Both are off-policy by construction. Every decision records its policy
+version and the exact probabilities it was sampled from, PPO's ratio is
+taken against those, and `policy_lag` reports how many versions old the
+trained decisions are (about 1-2 for continuous plus asynchronous).
+
 ## Training batch
 
 For each finished game the batch holds:
 
 * one **actor stream** per learning seat, with the game's per-position labels;
-* one **critic stream**. Plump's is a perfect-information "oracle" stream,
-  with every hand visible and absolute seat ids, so its value columns name
-  seats directly;
+* one **critic stream**, or one per seat. Plump's is a single
+  perfect-information "oracle" stream with absolute seat ids, so its value
+  columns name seats directly. Rummy's are per seat and seat-relative, with
+  the same positions as the actor streams (`critic_shift` maps columns back
+  to seats);
 * every decision, addressed into both: its actor row and position, and the
   critic position of the same pre-action state.
 
@@ -106,8 +132,9 @@ that exact, since padding follows every readout.
    value MSE plus the game's critic auxiliaries.
 
 `behavior_kl` in the metrics compares the cached, reduced-precision rollout
-policy with the full-sequence replay. It should stay at numerical noise; a
-rise means rollout and training disagree about the inputs.
+policy with the full-sequence replay. With batch collection it should stay at
+numerical noise; a rise means rollout and training disagree about the inputs.
+With continuous or asynchronous collection it also measures policy lag.
 
 ## Precision and speed
 
@@ -115,12 +142,20 @@ rise means rollout and training disagree about the inputs.
   probability-sensitive quantity. KV cache in fp16 (faster than bf16 for
   cached attention on MPS).
 * `CARDGYM_METAL_TRUNK=1` on Apple silicon routes the trunk (forward,
-  backward, and cached decode) through fused Metal kernels
-  (`cardgym/nn/metal_trunk.py`) for sequences up to 128 tokens. It halved
-  plump's iteration time and matches autocast within bf16 rounding.
+  backward, and cached decode, including gathered cache rows) through fused
+  Metal kernels (`cardgym/nn/metal_trunk.py`). Attention tiles keys through
+  threadgroup memory, so any length works. It halved plump's iteration time
+  and matches autocast within bf16 rounding. Games may fuse their own layers
+  under the same switch (Rummy's card grid, `games/rummy/metal_grid.py`).
 * `microbatch_positions` is the update's memory lever; it does not change the
-  accumulated loss. Attention activations grow with stream length, so long
-  streams (Rummy's reach 400 tokens) need smaller microbatches.
+  accumulated loss.
+* MPS pitfalls that cost more than the arithmetic around them: reducing or
+  broadcasting over a middle axis (a suit mean of [N, 4, 13, 32] measured 33
+  ms as `mean(dim=1)`, 1.3 ms as a [1, 4] matmul; the backward of a broadcast
+  is that reduction); dtype casts (~0.2 ms of dispatch each); autocast's
+  weight-cast cache, which only works outside `inference_mode` and only until
+  the outermost autocast context exits; and blocking transfers, which wait
+  for all queued work.
 * Gradients are given their parameter's layout before each optimizer step:
   fused MPS Adam rejects mismatched strides, which MPS Conv1d backward
   produces.

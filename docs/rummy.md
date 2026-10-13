@@ -62,44 +62,45 @@ Two misconceptions are worth stating:
   the sum of a multiset is injective (any card count is a linear readout once
   `d >= 52`). Rummy goes further: each card type is its own categorical field.
 
-## Tokens: one event, one decision
+## Tokens: one token per own decision
 
-Every decision produces one event and every event is one token in every
-stream:
+A seat's stream holds exactly one token per decision that seat makes: the
+observation it decides from.
 
 ```text
-[DEAL] [event of decision 1] [event of decision 2] ...
+seat 0:  [obs before decision 1] [obs before decision 2] ...
 ```
 
-A stream therefore has `1 + decisions` tokens, every stream of a game has the
-same length, and the token an action produces is the readout of the next
-decision. The longest stream is `1 + 2 * max_turns + 104` (a draw and a
-discard per turn, plus at most one meld or lay-off per card that reaches the
-table): 505 at `max_turns = 200`. Measured lengths are far shorter (below).
+Opponents' turns are never tokens of their own in it. A token states the
+present and summarizes everything since the seat's previous token:
 
-Each token is 17 event fields plus the **ledger**: 52 codes, one per card
-type.
+* event fields (`tokens.py`): the decision phase (draw or play), the seat's
+  own previous action (kind, card, meld kind and size), per opponent whether
+  it drew from the stock or took the discard top since then (and which card
+  it took) and what it discarded, stock size, the four hand sizes, who has
+  opened, opening points laid this turn, players, round;
+* the **ledger**: 52 codes, one per card type: the locations of its two
+  copies as an unordered pair over 8 locations (36 codes), times who moved the
+  card type since the seat's previous token (nobody, the seat itself, or
+  opponent 1-3), times whether a copy can be laid off on the table: 360
+  codes. The seat's locations are: unseen, its hand, each opponent's publicly
+  known holdings (cards it took from the discard pile and has not played
+  since), table, discard pile, discard top.
 
-* Event fields (`tokens.py`): type (deal, stock draw, discard take, meld,
-  lay-off, discard), actor, the card (hidden on someone else's stock draw),
-  meld kind and size, next actor and phase, stock size, the four hand sizes,
-  who has opened, opening points laid so far this turn, players, round. Seats
-  are observer-relative.
-* Ledger code per card type: the locations of its two copies as an unordered
-  pair over 8 locations (36 codes), times two flags: *moved by this event*
-  and *can be laid off on the table*. The actor's locations are: unseen, my
-  hand, each opponent's publicly known holdings (cards it took from the
-  discard pile and has not played since), table, discard pile, discard top.
-  A meld token names its cards through the moved flags; the layable flag
-  summarizes the table's structure in card space.
+So a game costs `decisions + seats` actor positions, not `seats x events`
+(3.5x fewer at three players), streams are tens of tokens (the longest
+possible is `2 * ceil(max_turns / 2) + 104`), every position is a decision,
+and the KV cache only grows for the seat that acts. What is given up is the
+order of an opponent's melds within its turn, which the policy has no use for.
 
-The ledger is exactly the viewer's knowledge: a test rebuilds it from the
-events the viewer saw and compares (`tests/rummy/test_rummy_streams.py`).
+The ledger is exactly the viewer's knowledge: a test rebuilds it, and the
+mover codes and opponent fields, from the events the viewer saw
+(`tests/rummy/test_rummy_streams.py`).
 
-The critic reads a perfect-information **oracle** stream with the same events
-and the same ledger layout, except that location `1 + j` is absolute seat
-`j`'s whole hand, "unseen" becomes the stock, every drawn card is visible,
-and one more field shows the next stock card.
+The critic reads a per-seat **oracle** stream with the same positions and
+layout, except that location `1 + j` is seat `j`'s whole hand, "unseen" is
+the stock, stock draws show their card, and one more field shows the next
+stock card. Its value head is seat-relative like the actor's.
 
 ## The card grid
 
@@ -116,8 +117,17 @@ cyclic, to rotating ranks; only card points break the rank symmetry. So:
   embedding, added to the event-field sum. Keeping per-card weights (rather
   than pooling) preserves card identity.
 
-It runs once per token, so its cost is that of roughly one extra trunk
-layer, and it is part of the token's input, so rollout caches it implicitly.
+It runs once per token and is part of the token's input, so rollout caches
+it implicitly.
+
+Execution is shaped for MPS, where reductions and broadcasts over a middle
+axis are pathologically slow: the rank convolution runs as one
+block-circulant GEMM per suit row (built from the Conv1d weights and cached
+between optimizer steps), and suit pooling and its broadcast are [1, 4] and
+[4, 1] matmuls. With `CARDGYM_METAL_TRUNK=1` the narrow per-card work
+(embedding + RMSNorm, pooling, the across projection, GELU, the output
+projection, residual, next norm) runs in fused kernels (`metal_grid.py`),
+forward and backward.
 
 ## Actions as candidates
 
@@ -138,18 +148,18 @@ candidate per card type and identical target melds are one candidate.
 (their grid features at the decision point, plus an identity row), plus for a
 lay-off the sum of the target meld's cards. It adds a projection of the
 readout hidden state and scores the result with a small MLP (additive
-attention). The policy reads the readout token itself, so its card-level view
-is exact even where the token summary blurs. The core passes readout tokens
-to every policy head for this (`PolicyModel.policy_logits(..., tokens)`).
+attention). The grid features are the ones the embedding computed for the
+readout token (`pop_context`), so the card-level view is exact even where the
+token summary blurs, at no extra encoding.
 
 ## Training
 
-Rummy uses the shared pipeline unchanged ([architecture](architecture.md)):
-KV-cached merged self-play, PPO with Monte Carlo advantages from the oracle
-critic, adaptive entropy floors per head, the auxiliary gradient budget, and
-an actor value probe. Each decision of a turn is its own PPO row; its baseline
-is the critic's value at the token before it. Every stream position is
-supervised by the auxiliaries:
+Rummy uses the shared pipeline ([architecture](architecture.md)): PPO with
+Monte Carlo advantages from the oracle critic, adaptive entropy floors per
+head, the auxiliary gradient budget, and an actor value probe. Every position
+is a decision row; its baseline is the critic's value at the same position of
+the seat's oracle stream. Every position is also supervised by the
+auxiliaries:
 
 * `hands` (actor): how many copies of each card type each opponent holds,
   trained only where the viewer cannot already know (some copy unseen). This
@@ -160,68 +170,75 @@ supervised by the auxiliaries:
 Returns are relative points (score minus mean opponent score) and
 `value_reward_scale = 50`.
 
+Collection is continuous and asynchronous (`[rollout]`): one lane per
+(players, hand size) keeps `games_per_shape` games in flight, finished games
+are replaced in the same wave, unfinished ones carry over, and a separate
+process collects the next batch during the update. Decisions are therefore
+1-2 policy versions old when trained (`policy_lag`); PPO's ratio is taken
+against their recorded probabilities. If lag starts to hurt (rising
+`behavior_kl` and `clip_fraction`), decoupled PPO (clip around the
+pre-update policy, truncated importance weight to the behavior policy) is the
+first lever.
+
 ## Evaluation
 
 `cardgym rummy evaluate MODEL --opponent heuristic` plays a seeded deal bank
 in both directions (one model seat against P - 1 heuristic seats, and one
 heuristic seat against P - 1 model seats, rotating the lone seat), through
-the batched collector. `cardgym rummy simulate` prints rule-based statistics.
+the continuous collector. `cardgym rummy simulate` prints rule-based statistics.
 The heuristic (`heuristic.py`) takes a discard that makes a new meld, melds
 and lays off at once, and discards its least connected, highest-value card.
 
 ## Measured (M5 Pro, base preset)
 
+At the untrained start (games of ~250 events, the slowest regime), 144 games
+per update:
+
+| | per iteration |
+| --- | --- |
+| first design (one token per event per stream, batch collection) | 56 s (collect 24, update 33) |
+| one token per own decision, continuous collection | 22 s |
+| + grid as GEMMs (no middle-axis reductions) | ~19 s (update 8.1) |
+| + fused trunk (tiled attention) and fused card grid | 7 s (collect 3, update 3.8-4.1) |
+| + asynchronous rollout | **4.9 s** (update 4.7, rollout 3.9 hidden) |
+
 | | |
 | --- | --- |
-| engine + tokens, Python | ~33 us per decision (`simulate`: 25-60 us per event incl. all ledgers) |
-| stream length | ~250 events untrained (stock-outs); ~130 by iteration 100; heuristic play 60-80 |
-| decode wave | flat ~20 ms up to ~860 rows: bound by per-op host dispatch, not the GPU |
-| rollout, 144 / 288 / 576 games (iteration-100 policy) | 6.5 / 8.0 / 13.5 s (2,841 / 4,518 / 5,397 decisions/s) |
-| `behavior_kl` (bf16 compute, fp16 KV cache) | ~-8e-9: cached rollout equals full replay |
-| update activation memory, 16k positions at L = 416 | 5.0 GB saved for backward (grid 1.4 GB, attention-dominated trunk 3.5 GB) |
-| update peak driver memory | 17.9 GB at 16k-position microbatches; 9.4 GB at 8k (the preset) |
+| actor positions per update | 115k -> ~40k (critic the same) |
+| collection | 4.8k -> 12.5k decisions/s; host dispatch per wave 22 -> 2.7 ms |
+| host side per decision (engine, tokens, candidates) | ~30 us, now the rollout's bound |
+| fused trunk backward, 65 x 160 positions, two cotangents | 198 -> 90 ms |
+| card grid forward+backward, 16k positions | 429 -> 143 (GEMMs) -> 59 ms (fused) |
+| memory | trainer ~5 GB peak, rollout process ~2 GB |
+| `behavior_kl` (synchronous, iteration 1) | ~1e-6: cached rollout equals replay |
 
-Rollouts show low GPU utilization because a decode wave is ~200 small ops
-whose host dispatch cost exceeds the GPU work below ~1,700 rows. Two fixes
-are in: decode shapes are bucketed (MPS compiles a graph per shape and exact
-shapes change every wave: 1.5x faster rollouts), and transfers are
-non-blocking (on MPS a blocking copy waits for all queued work). Overlapping
-two cohorts measured slower while dispatch-bound. The remaining levers are
-more games per update (rollout time grows sublinearly) and fewer ops per wave
-(a fused decode, as plump's Metal trunk does).
-
-Attention activations grow with stream length, so Rummy needs half plump's
-microbatch, and `[ppo] min_group_sequences = 32` merges the long tail of
-one- or two-stream length buckets. The first runs hit NaN policy gradients:
-the card grid's op-by-op RMSNorm backward, rerun from MPS's graph cache at the
-policy head's few hundred decision rows, returned all-NaN input gradients in
-about 1 of 4 passes. The grid now uses `F.rms_norm` (0 failures in 72
-passes; gradients within bf16 accuracy of a CPU fp32 reference), and the
-trainer skips any non-finite step as a safety net.
-
-First run (`r3`, preset as committed): after 100 iterations (75 minutes),
-rounds with a winner rose from 16% to ~75%, rounds shortened from 120 to 57
-turns, discard takes fell from 50% to 22%. Against the heuristic the policy
-improved from -120 to -42 points per seat (relative reward, both directions);
-against random play it scores +81.
+One unexplained glitch: a single iteration of one benchmark reported a
+normalized draw entropy of 1.076 (at most 1 by construction), with every
+gradient norm and loss matching an identical rerun. It did not reproduce; it
+looks like a small-reduction flake on MPS (plump saw the same class below a
+few hundred rows).
 
 ## Status and next steps
 
 The pipeline is complete and tested (`tests/rummy`: meld search against brute
-force, engine invariants, ledger privacy against an independent replay,
-cached rollout against full replay, end-to-end CLI). Everything about the
-recipe is a starting point:
+force, engine invariants, ledger privacy and mover codes against an
+independent replay, oracle streams, continuous rollout against full replay,
+fused kernels against PyTorch, end-to-end CLI including asynchronous
+rollout). The first run on the earlier design (`r3`) reached -23 points per
+seat against the heuristic after 200 iterations. Everything about the recipe
+is a starting point:
 
-* **Schedule.** Early from-scratch learning is limited by optimizer steps per
-  hour; the preset trades batch size (144 games) for two PPO epochs and a
-  short warmup. Collection time is set by the longest game (one wave per
-  event), so it falls as play improves.
-* **Size.** d_model 256, 8 layers, card grid 2 x 32 wide. The fused Metal
-  trunk covers streams of at most 128 tokens, so Rummy runs the PyTorch path.
-* **Advantages.** Monte Carlo over ~30-100 decisions per seat; GAE
-  (`advantage_estimator = "gae"`) is the first variance lever to try.
+* **Schedule.** 144 games and two PPO epochs per update. With the rollout
+  hidden, iteration time is the update's; larger batches cost linearly.
+* **Size.** d_model 256, 8 layers, head_dim 32 (GQA 8/2), card grid 2 x 32
+  wide.
+* **Advantages.** Monte Carlo; GAE is the first variance lever.
+* **Lag.** Decoupled PPO if `policy_lag` starts to cost (see Training).
 * **Beliefs.** `hands` is linear in the readout; a card-conditioned readout
   (hidden x per-card grid features) is the natural upgrade.
 * **Symmetry.** Suit permutation is an exact symmetry of the rules; the grid
   respects it, the per-card summary and event-card rows do not. Random suit
   relabelling per game is free augmentation.
+* **Speed.** The fused grid and attention kernels use scalar FMAs (~1
+  TFLOPS); simdgroup-matrix versions and fused policy heads are the next
+  kernel work, and the host engine (~30 us per decision) bounds the rollout.

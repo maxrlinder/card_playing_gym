@@ -1,6 +1,7 @@
 # First Rummy recipe: the architecture of docs/rummy.md at a starting size.
-# Model width, depth, entropy floors, and batch size are untuned.
-#   CARDGYM_RUNS_DIR=... cardgym rummy train r1 --config configs/rummy/base.toml
+# Model width, depth, entropy floors, and batch size are untuned. Run with the
+# fused Metal kernels (trunk and card grid):
+#   CARDGYM_METAL_TRUNK=1 cardgym rummy train r1 --config configs/rummy/base.toml
 
 [run]
 game = "rummy"
@@ -16,7 +17,10 @@ kv_dtype = "fp16"
 # Keep every lane's games in flight and refill as they end: a collection costs
 # about quota * mean length / in_flight waves instead of the longest game.
 mode = "continuous"
-concurrency = 2.0
+concurrency = 1.0
+# Collect the next batch in a separate process during the update. The rollout
+# (~12k decisions/s) then hides behind the update; policy lag is ~2 versions.
+asynchronous = true
 
 [model]
 d_model = 256
