@@ -287,7 +287,10 @@ def _iteration(components, rng: random.Random, iteration: int) -> dict[str, floa
     collector = components.collector
     started = time.perf_counter()
     trainer.actor.eval()
-    trajectories = collector.collect(game.new_games(rng, iteration))
+    if config.rollout.mode == "continuous":
+        trajectories = collector.collect(game.lanes(config.rollout.concurrency), rng, version=iteration)
+    else:
+        trajectories = collector.collect(game.new_games(rng, iteration))
     collector.release()
     collected = time.perf_counter()
     batch = build_batch(
@@ -320,6 +323,9 @@ def _iteration(components, rng: random.Random, iteration: int) -> dict[str, floa
         # Host time blocked on the device: the rest of collect_sec is host work.
         "collect_wait_sec": collection.wait_sec,
     }
+    if config.rollout.mode == "continuous":
+        row["games_in_flight"] = collection.in_flight
+        row["policy_lag"] = collection.policy_lag
     row.update(game.rollout_summary(trajectories))
     row.update(stats)
     return row

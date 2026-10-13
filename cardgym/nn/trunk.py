@@ -182,17 +182,23 @@ class DecoderBlock(nn.Module):
         key_lengths: torch.Tensor,
         span: int,
         value_embedding: torch.Tensor | None = None,
+        rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Rows 0..B-1 each append T tokens at their own offset.
+        """Cache rows (0..B-1, or ``rows``) each append T tokens at their own offset.
 
         ``key_lengths[b]`` is row b's length including its first new token;
-        query t of row b may see keys below ``key_lengths[b] + t``.
+        query t of row b may see keys below ``key_lengths[b] + t``. Explicit
+        ``rows`` gather each row's keys (a copy); the dense default reads a
+        zero-copy prefix of the pool.
         """
 
         q, k, v = self._qkv(self.ln_attn(x), value_embedding)
-        rows = torch.arange(x.shape[0], device=x.device)
-        cache.write_step(layer, rows, write_positions, k, v)
-        k_all, v_all = cache.read(layer, None, span, count=x.shape[0])
+        if rows is None:
+            cache.write_step(layer, torch.arange(x.shape[0], device=x.device), write_positions, k, v)
+            k_all, v_all = cache.read(layer, None, span, count=x.shape[0])
+        else:
+            cache.write_step(layer, rows, write_positions, k, v)
+            k_all, v_all = cache.read(layer, rows, span)
         attn = self._grouped_attention(q.to(cache.dtype), k_all, v_all, key_lengths)
         return self._finish(x, attn.to(x.dtype))
 
@@ -360,8 +366,9 @@ class Trunk(nn.Module):
         positions: torch.Tensor,
         readout_offsets: torch.Tensor,
         span: int | None = None,
+        rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Append a padded run of tokens to rows 0..B-1, each at its own length.
+        """Append a padded run of tokens to rows 0..B-1 (or ``rows``), each at its own length.
 
         ``positions[b]`` is row b's current length (its next write offset).
         Rows shorter than the run are padded; the surplus K/V lands on
@@ -374,10 +381,10 @@ class Trunk(nn.Module):
         """
 
         length = x.shape[1]
-        rows = torch.arange(x.shape[0], device=x.device)
-        if self.uses_metal(x.device, length) and self.metal.decode_supported(cache):
+        batch = torch.arange(x.shape[0], device=x.device)
+        if rows is None and self.uses_metal(x.device, length) and self.metal.decode_supported(cache):
             normed = self.metal.decode(x, ple, values, cache, positions, self)
-            return normed[rows, readout_offsets]
+            return normed[batch, readout_offsets]
         steps = torch.arange(length, device=positions.device)[None, :]
         write_positions = (positions[:, None] + steps).clamp(max=cache.max_len - 1)
         if span is None:
@@ -385,7 +392,7 @@ class Trunk(nn.Module):
         span = min(span, cache.max_len)
         for layer, block in enumerate(self.blocks):
             x = block.forward_ragged(
-                x, cache, layer, write_positions, positions + 1, span, self._value(values, layer)
+                x, cache, layer, write_positions, positions + 1, span, self._value(values, layer), rows
             )
             x = self._add_ple(x, ple, layer)
-        return self.final_norm(x[rows, readout_offsets])
+        return self.final_norm(x[batch, readout_offsets])

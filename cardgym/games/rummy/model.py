@@ -22,7 +22,9 @@ embedding sums its kind, its moved cards and (for a lay-off) the target
 meld's cards, each card represented by its grid features at the decision
 point plus an identity row. The readout hidden state is added and an MLP
 scores the result (additive attention), so the head sees card-level detail
-the pooled token summary may blur.
+the pooled token summary may blur. Every token is a decision point, so the
+heads reuse the grid features the embedding just computed (``pop_context``)
+rather than encoding the ledger twice.
 """
 
 from __future__ import annotations
@@ -56,7 +58,8 @@ class RummyModelConfig:
     n_heads: int = 8
     n_kv_heads: int = 2
     d_ff: int = 768
-    per_layer_dim: int = 32
+    # 64 (or 0) keeps the fused Metal trunk available.
+    per_layer_dim: int = 64
     value_embeddings: ValueEmbeddingMode = "alternating"
     # Card grid: per-card width, block MLP width, blocks, rank-convolution taps.
     ledger_width: int = 32
@@ -105,34 +108,55 @@ class FusedRMSNorm(nn.Module):
 
 
 class GridBlock(nn.Module):
-    """Residual mix of rank neighbours (circular) and same-rank suits on the card grid."""
+    """Residual mix of rank neighbours (circular) and same-rank suits on the card grid.
+
+    The layer is a circular convolution along each suit's 13 ranks plus a
+    linear map of each rank's mean over suits, then GELU and a projection.
+    Its execution is shaped for MPS, where reducing or broadcasting over a
+    middle axis is pathologically slow (a [N, 4, 13, 32] suit mean measured
+    33 ms against 1.3 ms as a matmul): the convolution runs as one
+    block-circulant GEMM per suit row, built from the Conv1d weights each
+    call, and the suit pooling and its broadcast back are [1, 4] and [4, 1]
+    matmuls, which keeps their backward passes GEMMs too. Same function and
+    parameters as the direct form; 3.4x faster forward and backward.
+    """
 
     def __init__(self, width: int, hidden: int, kernel: int) -> None:
         super().__init__()
         self.kernel = kernel
         self.norm = FusedRMSNorm(width)
-        # Conv1d parameters, applied as one matmul over the circular rank
-        # window (MPS convolution backward returns permuted-stride gradients).
         self.along_rank = nn.Conv1d(width, hidden, kernel)
         self.across_suits = nn.Linear(width, hidden, bias=False)
         self.out = nn.Linear(hidden, width)
+        # shifts[k, i, o] = 1 when input rank i is tap k of output rank o (circular padding).
+        half = kernel // 2
+        shifts = torch.zeros(kernel, NUM_RANKS, NUM_RANKS)
+        for tap in range(kernel):
+            for rank in range(NUM_RANKS):
+                shifts[tap, (rank + tap - half) % NUM_RANKS, rank] = 1.0
+        self.register_buffer("shifts", shifts, persistent=False)
+        self.register_buffer("pool", torch.full((1, NUM_SUITS), 1.0 / NUM_SUITS), persistent=False)
+        self.register_buffer("spread", torch.ones(NUM_SUITS, 1), persistent=False)
+
+    def circulant(self) -> torch.Tensor:
+        """The convolution as a [13 * width, 13 * hidden] matrix acting on one suit row."""
+
+        weight = self.along_rank.weight  # [hidden, width, kernel]
+        hidden, width, _ = weight.shape
+        return torch.einsum("kio,hwk->iwoh", self.shifts.to(weight.dtype), weight).reshape(
+            NUM_RANKS * width, NUM_RANKS * hidden
+        )
 
     def forward(self, grid: torch.Tensor) -> torch.Tensor:  # [N, suits, ranks, width]
-        ranks = grid.shape[2]
+        count, _, _, width = grid.shape
+        hidden = self.out.in_features
         y = self.norm(grid)
-        half = self.kernel // 2
-        # Window entry j of rank r is rank (r + j - half) mod 13, as in a
-        # circularly padded convolution.
-        window = torch.cat(
-            [torch.cat([y[:, :, shift:], y[:, :, :shift]], dim=2) for shift in (
-                (offset % ranks) for offset in range(-half, half + 1)
-            )],
-            dim=-1,
-        )
-        conv = self.along_rank
-        along = F.linear(window, conv.weight.permute(0, 2, 1).reshape(conv.out_channels, -1), conv.bias)
-        across = self.across_suits(y.mean(dim=1, keepdim=True))
-        return grid + self.out(F.gelu(along + across))
+        rows = y.reshape(count, NUM_SUITS, NUM_RANKS * width)
+        along = F.linear(rows, self.circulant().t(), self.along_rank.bias.repeat(NUM_RANKS))
+        pooled = (self.pool.to(rows.dtype) @ rows).view(count, NUM_RANKS, width)
+        across = self.across_suits(pooled).view(count, 1, NUM_RANKS * hidden)
+        mixed = along + self.spread.to(across.dtype) @ across
+        return grid + self.out(F.gelu(mixed).view(count, NUM_SUITS, NUM_RANKS, hidden))
 
 
 class CardGrid(nn.Module):
@@ -177,8 +201,18 @@ def _bag(ids: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 
 class RummyEmbedding(nn.Module):
-    def __init__(self, config: RummyModelConfig, ple_width: int, value_width: int) -> None:
+    """Event fields plus the card-grid summary; optionally keeps the per-card features.
+
+    With ``keep_cards`` the latest forward's per-card features [..., 52, w]
+    stay available (once) for the policy heads.
+    """
+
+    def __init__(
+        self, config: RummyModelConfig, ple_width: int, value_width: int, *, keep_cards: bool = False
+    ) -> None:
         super().__init__()
+        self.keep_cards = keep_cards
+        self.kept: torch.Tensor | None = None
         offsets = torch.tensor([sum(FIELD_VOCAB[:i]) for i in range(NUM_FIELDS)], dtype=torch.long)
         self.register_buffer("offsets", offsets, persistent=False)
         rows = sum(FIELD_VOCAB)
@@ -195,7 +229,9 @@ class RummyEmbedding(nn.Module):
     def forward(self, tokens: torch.Tensor):
         tokens = tokens.long()
         ids = tokens[..., :NUM_FIELDS] + self.offsets
-        _, summary = self.grid(tokens[..., LEDGER_START:])
+        cards, summary = self.grid(tokens[..., LEDGER_START:])
+        if self.keep_cards:
+            self.kept = cards
         return (
             _bag(ids, self.fields.weight) + summary,
             None if self.ple_fields is None else _bag(ids, self.ple_fields.weight),
@@ -258,7 +294,7 @@ class RummyActor(PolicyModel):
         self.config = config
         trunk = self.trunk_config
         d = config.d_model
-        self.embedding = RummyEmbedding(config, trunk.ple_width, trunk.value_width)
+        self.embedding = RummyEmbedding(config, trunk.ple_width, trunk.value_width, keep_cards=True)
         self.scorer = CandidateScorer(d, config.ledger_width, config.score_dim)
         self.value_head = value_mlp(d, MAX_PLAYERS)
         # Beliefs: copies of each card type in each opponent's hand.
@@ -271,12 +307,16 @@ class RummyActor(PolicyModel):
     def embed(self, tokens: torch.Tensor):
         return self.embedding(tokens)
 
-    def policy_logits(self, hidden, head, features=None, tokens=None):
-        if features is None or tokens is None:
+    def pop_context(self) -> torch.Tensor | None:
+        cards, self.embedding.kept = self.embedding.kept, None
+        return cards
+
+    def policy_logits(self, hidden, head, features=None, tokens=None, context=None):
+        if features is None or (tokens is None and context is None):
             raise ValueError("Rummy policy heads score candidate lists at a readout token.")
         if head not in self.policy_heads:
             raise ValueError(f"Unknown rummy policy head {head!r}.")
-        grid = self.embedding.grid.cards(tokens[..., LEDGER_START:])
+        grid = self.embedding.grid.cards(tokens[..., LEDGER_START:]) if context is None else context
         return self.scorer(hidden, grid, features["kind"], features["cards"], features["target"])
 
     def player_values(self, hidden: torch.Tensor) -> torch.Tensor:

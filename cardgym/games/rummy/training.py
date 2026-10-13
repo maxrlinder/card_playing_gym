@@ -1,7 +1,8 @@
 """Rummy training streams, labels, and auxiliary objectives.
 
-Every stream of a game has one token per event, so a decision's actor
-position is also its critic position. Auxiliaries are dense from the deal on:
+Each seat has an actor stream and an oracle (critic) stream with one token per
+own decision, so a decision's actor position is also its critic position and
+every position is a decision. Auxiliaries are dense over every position:
 
 * ``hands`` (actor): copies (0/1/2) of every card type in every opponent's
   hand, supervised only where the viewer cannot already know the answer
@@ -28,7 +29,7 @@ from .cards import NUM_CARDS
 from .engine import LOC_UNSEEN, MAX_PLAYERS, NUM_PAIRS, PAIR_LOCATIONS
 from .model import COUNT_CLASSES, NO_WINNER, OPPONENTS
 from .selfplay import RummySelfPlay
-from .tokens import F_NEXT_ACTOR, F_NEXT_PHASE, LEDGER_START
+from .tokens import F_PHASE, LEDGER_START
 
 IGNORE = -1
 PENALTY_SCALE = 100.0
@@ -66,14 +67,18 @@ def training_sequences(trajectory: Trajectory) -> GameSequences:
     assert isinstance(game, RummySelfPlay)
     engine = game.engine
     players = game.num_players
-    hands = np.stack(game.hands)  # [L, P, 52] true hands after each event
-    length = hands.shape[0]
     penalties = engine.penalties() / PENALTY_SCALE
     actor: dict[int, TrainingSequence] = {}
+    critic: dict[int, TrainingSequence] = {}
     for seat in range(players):
         stream = trajectory.streams[seat]
-        if stream.shape[0] != length:
-            raise AssertionError("Every stream must hold one token per event.")
+        length = stream.shape[0]
+        if length == 0:
+            continue  # the round ended before this seat's first decision
+        oracle = np.stack(game.oracle[seat])
+        hands = np.stack(game.hands[seat])  # [L, P, 52] true hands at each token
+        if oracle.shape[0] != length or hands.shape[0] != length:
+            raise AssertionError("Actor and oracle streams must hold one token per own decision.")
         unseen = UNSEEN_COPIES[stream[:, LEDGER_START:] % NUM_PAIRS] > 0  # [L, 52]
         beliefs = np.full((length, OPPONENTS, NUM_CARDS), IGNORE, dtype=np.int8)
         for offset in range(1, players):
@@ -81,30 +86,17 @@ def training_sequences(trajectory: Trajectory) -> GameSequences:
             beliefs[:, offset - 1] = np.where(unseen, opponent, IGNORE)
         relative_penalty = np.zeros(MAX_PLAYERS, dtype=np.float32)
         relative_penalty[:players] = np.roll(penalties, -seat)
-        winner = NO_WINNER if engine.winner is None else (engine.winner - seat) % players
+        winner = np.int64(NO_WINNER if engine.winner is None else (engine.winner - seat) % players)
         actor[seat] = TrainingSequence(
-            stream,
-            0,
-            {"hands": beliefs, "winner": np.int64(winner), "penalty": relative_penalty},
+            stream, 0, {"hands": beliefs, "winner": winner, "penalty": relative_penalty}
         )
-    oracle = np.stack(game.oracle)
+        critic[seat] = TrainingSequence(oracle, 0, {"winner": winner, "penalty": relative_penalty})
     critic_positions = []
     for decision in trajectory.decisions:
-        position = decision.position
         phase = 0 if decision.head == "draw" else 1
-        if oracle[position, F_NEXT_ACTOR] != decision.seat or oracle[position, F_NEXT_PHASE] != phase:
-            raise AssertionError("Critic address is not tied to the acting seat and phase.")
-        critic_positions.append(position)
-    absolute_penalty = np.zeros(MAX_PLAYERS, dtype=np.float32)
-    absolute_penalty[:players] = penalties
-    critic = TrainingSequence(
-        oracle,
-        0,
-        {
-            "winner": np.int64(NO_WINNER if engine.winner is None else engine.winner),
-            "penalty": absolute_penalty,
-        },
-    )
+        if critic[decision.seat].tokens[decision.position, F_PHASE] != phase:
+            raise AssertionError("Critic address is not tied to the acting seat's decision.")
+        critic_positions.append(decision.position)
     return GameSequences(actor=actor, critic=critic, critic_positions=critic_positions)
 
 

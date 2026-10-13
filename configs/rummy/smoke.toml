@@ -11,7 +11,7 @@ seed = 0
 
 [rollout]
 kv_dtype = "fp32"
-max_rows = 1024
+mode = "continuous"
 
 [model]
 d_model = 32

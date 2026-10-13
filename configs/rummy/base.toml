@@ -13,7 +13,10 @@ seed = 0
 
 [rollout]
 kv_dtype = "fp16"
-max_rows = 4096
+# Keep every lane's games in flight and refill as they end: a collection costs
+# about quota * mean length / in_flight waves instead of the longest game.
+mode = "continuous"
+concurrency = 2.0
 
 [model]
 d_model = 256
@@ -21,7 +24,7 @@ n_layers = 8
 n_heads = 8
 n_kv_heads = 2
 d_ff = 768
-per_layer_dim = 32
+per_layer_dim = 64
 value_embeddings = "alternating"
 ledger_width = 32
 ledger_hidden = 64
@@ -45,11 +48,10 @@ actor_value_coef = 0.2
 auxiliary_grad_fraction = 0.25
 entropy_mode = "adaptive"
 entropy_targets = { draw = 0.15, play = 0.15 }
-# Streams reach ~400 tokens, where attention dominates activation memory:
-# 8192 positions peak at ~9.4 GB (16384 reached 17.9 GB).
-microbatch_positions = 8192
-sequence_bucket_width = 32
-critic_sequence_bucket_width = 32
+# One token per own decision: streams are tens of tokens, rarely past 128.
+microbatch_positions = 16384
+sequence_bucket_width = 16
+critic_sequence_bucket_width = 16
 min_group_sequences = 32
 
 [game]

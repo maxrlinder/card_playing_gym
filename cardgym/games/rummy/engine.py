@@ -66,8 +66,33 @@ for _code, (_a, _b) in enumerate(_pairs):
     PAIR[_a, _b] = PAIR[_b, _a] = _code
 NUM_PAIRS = len(_pairs)
 PAIR_LOCATIONS = np.array(_pairs, dtype=np.int64)  # [36, 2]
-# A ledger code is pair + NUM_PAIRS * (moved + 2 * layable).
-NUM_LEDGER_CODES = NUM_PAIRS * 4
+# Who last moved a card type, as the viewer sees it: nobody since the viewer's
+# previous token, the viewer itself, or opponent 1..3 (observer-relative).
+NUM_MOVERS = 1 + MAX_PLAYERS
+# A ledger code is pair + NUM_PAIRS * (mover + NUM_MOVERS * layable).
+NUM_LEDGER_CODES = NUM_PAIRS * NUM_MOVERS * 2
+
+
+def _pair_rotations() -> dict[int, np.ndarray]:
+    """``ROTATE[players][seat]`` maps an absolute-seat pair code to seat-relative.
+
+    Location ``1 + j`` (absolute seat ``j``'s hand) becomes ``1 + (j - seat) %
+    players``; every other location is unchanged.
+    """
+
+    rotations = {}
+    for players in range(2, MAX_PLAYERS + 1):
+        table = np.zeros((players, NUM_PAIRS), dtype=np.int64)
+        for seat in range(players):
+            location = np.arange(NUM_LOCATIONS)
+            location[1 : 1 + players] = 1 + (np.arange(players) - seat) % players
+            for code, (a, b) in enumerate(_pairs):
+                table[seat, code] = PAIR[location[a], location[b]]
+        rotations[players] = table
+    return rotations
+
+
+ROTATE = _pair_rotations()
 
 
 class Action(NamedTuple):
@@ -133,7 +158,6 @@ class RummyEngine:
         self._candidates: list[Action] | None = None
         rotation = np.arange(MAX_PLAYERS)
         self._observed = (np.arange(num_players)[:, None] + rotation[None, :num_players]) % num_players
-        self._moved_reference: np.ndarray | None = None
 
     # -- queries -----------------------------------------------------------
 
@@ -310,20 +334,8 @@ class RummyEngine:
         counts[:, LOC_UNSEEN] = COPIES - counts[:, 1:].sum(axis=1)
         return counts
 
-    def ledgers(self, *, moved: bool = True) -> np.ndarray:
-        """Ledger codes [P + 1, 52]: copy-location pair, moved-this-event and layable flags.
+    def view_pairs(self) -> np.ndarray:
+        """Copy-location pair codes [P + 1, 52]: views 0..P-1 are the seats, view P the oracle."""
 
-        ``moved`` marks card types whose pair changed since the previous call
-        (so a meld token names its cards); the first call marks none.
-        """
-
-        counts = self.location_counts()
-        cumulative = counts.cumsum(axis=1)
-        first = (cumulative >= 1).argmax(axis=1)
-        second = (cumulative >= 2).argmax(axis=1)
-        pairs = PAIR[first, second]
-        changed = np.zeros_like(pairs) if self._moved_reference is None or not moved else (
-            pairs != self._moved_reference
-        ).astype(np.int64)
-        self._moved_reference = pairs
-        return pairs + NUM_PAIRS * (changed + 2 * self.layable.astype(np.int64)[None, :])
+        cumulative = self.location_counts().cumsum(axis=1)
+        return PAIR[(cumulative >= 1).argmax(axis=1), (cumulative >= 2).argmax(axis=1)]

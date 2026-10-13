@@ -38,12 +38,23 @@ class RolloutConfig:
     # Game groups decoded alternately: the device runs one group's wave while
     # the host steps another's games (2 overlaps them; 1 is lockstep).
     cohorts: int = 1
+    # "batch": deal one update's games together and decode until the last one
+    # ends. "continuous": keep games in flight, replace each as it ends, and
+    # carry the unfinished ones into the next update (the game must define
+    # lanes; max_rows and cohorts do not apply).
+    mode: Literal["batch", "continuous"] = "batch"
+    # continuous: games in flight per lane, as a multiple of its per-update quota.
+    concurrency: float = 1.0
 
     def validate(self) -> None:
         if self.max_rows < 1:
             raise ValueError("[rollout] max_rows must be positive.")
         if self.cohorts < 1:
             raise ValueError("[rollout] cohorts must be at least 1.")
+        if self.mode not in ("batch", "continuous"):
+            raise ValueError(f"Unknown [rollout] mode {self.mode!r}.")
+        if self.concurrency <= 0:
+            raise ValueError("[rollout] concurrency must be positive.")
 
 
 @dataclass(frozen=True)

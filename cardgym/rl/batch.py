@@ -1,9 +1,11 @@
 """Training batches: bucketed sequence groups plus per-head decision rows.
 
-Each trajectory contributes one actor stream per learning seat and one
-canonical critic stream (the game decides what the critic may see; plump's is
-a perfect-information "oracle" sequence). Streams are tail-padded to a bucket
-length and stacked; causal attention makes padding after a readout exact.
+Each trajectory contributes one actor stream per learning seat and either one
+canonical critic stream or one critic stream per seat (the game decides what
+the critic may see; plump's is one perfect-information "oracle" sequence with
+absolute seats, Rummy's a seat-relative oracle stream per seat). Streams are
+tail-padded to a bucket length and stacked; causal attention makes padding
+after a readout exact.
 
 Weighting (G games, P seats, every seat learning):
 
@@ -12,7 +14,8 @@ Weighting (G games, P seats, every seat learning):
   longer game contributes more decisions;
 * dense (per-position) losses spread each stream's mass evenly over its
   positions from ``dense_start`` on: an actor stream carries ``1 / (G P)``,
-  a critic stream ``1 / G``. Prefix and padding positions weigh zero.
+  a canonical critic stream ``1 / G`` (a per-seat one ``1 / (G P)``). Prefix
+  and padding positions weigh zero.
 """
 
 from __future__ import annotations
@@ -46,8 +49,10 @@ class GameSequences:
     """What a game derives from one finished trajectory for training."""
 
     actor: dict[int, TrainingSequence]  # absolute seat -> its own stream
-    critic: TrainingSequence
-    # Critic-stream position of each trajectory decision's pre-action state.
+    # One canonical stream (absolute seats), or seat -> a seat-relative stream.
+    critic: TrainingSequence | dict[int, TrainingSequence]
+    # Position of each trajectory decision's pre-action state in its critic
+    # stream (the acting seat's, for per-seat critics).
     critic_positions: list[int]
 
 
@@ -83,6 +88,10 @@ class DecisionRows:
     critic_group: np.ndarray
     critic_seq: np.ndarray
     critic_position: np.ndarray
+    # The critic stream's seat frame: seat-relative streams put the acting
+    # seat at column 0, so column = seat - shift and absolute seat i is
+    # column (i - shift) mod players.
+    critic_shift: np.ndarray
     features: dict[str, np.ndarray] | None
     advantages: np.ndarray  # float32, filled by the trainer
 
@@ -96,6 +105,7 @@ class PPOBatch:
     critic_groups: list[SequenceGroup]
     decisions: dict[str, DecisionRows]
     games: int
+    game_returns: list[np.ndarray]  # absolute terminal returns per game
 
 
 def bucket_length(length: int, width: int, capacity: int) -> int:
@@ -125,17 +135,23 @@ def build_batch(
     actor_entries: list[tuple[TrainingSequence, float, int, np.ndarray]] = []
     actor_slot: dict[tuple[int, int], int] = {}
     critic_entries: list[tuple[TrainingSequence, float, int, np.ndarray]] = []
+    critic_slot: dict[tuple[int, int | None], int] = {}
     for game_index, (trajectory, derived) in enumerate(zip(trajectories, sequences)):
         players = trajectory.game.num_players
         seat_weight = game_weight / len(derived.actor)
         for seat, sequence in derived.actor.items():
-            relative = np.zeros(max_players, dtype=np.float32)
-            relative[:players] = np.roll(trajectory.returns, -seat)
             actor_slot[(game_index, seat)] = len(actor_entries)
-            actor_entries.append((sequence, seat_weight, players, relative))
-        absolute = np.zeros(max_players, dtype=np.float32)
-        absolute[:players] = trajectory.returns
-        critic_entries.append((derived.critic, game_weight, players, absolute))
+            actor_entries.append((sequence, seat_weight, players, _relative(trajectory.returns, seat, max_players)))
+        if isinstance(derived.critic, dict):
+            critic_weight = game_weight / len(derived.critic)
+            for seat, sequence in derived.critic.items():
+                critic_slot[(game_index, seat)] = len(critic_entries)
+                critic_entries.append(
+                    (sequence, critic_weight, players, _relative(trajectory.returns, seat, max_players))
+                )
+        else:
+            critic_slot[(game_index, None)] = len(critic_entries)
+            critic_entries.append((derived.critic, game_weight, players, _relative(trajectory.returns, 0, max_players)))
 
     actor_groups, actor_address = _stack(
         actor_entries, actor_labels, bucket_width, max_length, min_group_sequences
@@ -149,7 +165,7 @@ def build_batch(
     for game_index, (trajectory, derived) in enumerate(zip(trajectories, sequences)):
         if len(derived.critic_positions) != len(trajectory.decisions):
             raise AssertionError("Every decision needs a critic address.")
-        critic_group, critic_seq = critic_address[game_index]
+        per_seat = isinstance(derived.critic, dict)
         for order, (record, critic_position) in enumerate(
             zip(trajectory.decisions, derived.critic_positions)
         ):
@@ -157,6 +173,7 @@ def build_batch(
             if slot is None:
                 continue
             group, seq = actor_address[slot]
+            critic_group, critic_seq = critic_address[critic_slot[(game_index, record.seat if per_seat else None)]]
             weight = actor_entries[slot][1]
             column = columns[record.head]
             column["group"].append(group)
@@ -172,6 +189,7 @@ def build_batch(
             column["critic_group"].append(critic_group)
             column["critic_seq"].append(critic_seq)
             column["critic_position"].append(critic_position)
+            column["critic_shift"].append(record.seat if per_seat else 0)
             features[record.head].append(record.features)
 
     decisions = {
@@ -182,7 +200,17 @@ def build_batch(
         critic_groups=critic_groups,
         decisions=decisions,
         games=games,
+        game_returns=[np.asarray(trajectory.returns, dtype=np.float64) for trajectory in trajectories],
     )
+
+
+def _relative(returns: np.ndarray, seat: int, max_players: int) -> np.ndarray:
+    """Returns in seat ``seat``'s frame (entry 0 is that seat), zero-padded."""
+
+    players = returns.shape[0]
+    relative = np.zeros(max_players, dtype=np.float32)
+    relative[:players] = np.roll(returns, -seat)
+    return relative
 
 
 def _stack(
@@ -295,6 +323,7 @@ def _decision_rows(column: dict[str, list], features: list) -> DecisionRows:
         critic_group=as_int("critic_group"),
         critic_seq=as_int("critic_seq"),
         critic_position=as_int("critic_position"),
+        critic_shift=as_int("critic_shift"),
         features=stacked,
         advantages=np.zeros(len(column["group"]), dtype=np.float32),
     )

@@ -107,6 +107,7 @@ class DecisionRecord:
     action: int
     probs: np.ndarray  # masked behavior policy, float32 [actions]
     features: dict[str, np.ndarray] | None = None
+    version: int = 0  # the collector's policy version when sampled
 
 
 @dataclass
@@ -131,6 +132,8 @@ class CollectionStats:
     wait_sec: float = 0.0  # host time blocked on the device
     sample_sec: float = 0.0
     step_sec: float = 0.0
+    in_flight: int = 0  # games still running when the collection returned
+    policy_lag: float = 0.0  # mean versions between sampling and the update
 
 
 @dataclass
@@ -163,8 +166,6 @@ def _round_up(value: int, multiple: int) -> int:
 class SelfPlayCollector:
     ROW_BUCKET = 64
     SPAN_BUCKET = 32
-    DECISION_BUCKET = 16
-    CANDIDATE_BUCKET = 8
 
     def __init__(
         self,
@@ -411,22 +412,12 @@ class SelfPlayCollector:
     def _launch_policies(self, cohort: _Cohort, hidden: torch.Tensor, states: list[_Live]) -> None:
         """Queue each pending decision's head on its actor's hidden state."""
 
-        by_head: dict[str, list[int]] = {}
-        for position, state in enumerate(states):
-            by_head.setdefault(state.pending.head, []).append(position)
-        with autocast_context(self.device, self.precision):
-            for head, positions in by_head.items():
-                # Pad the read to a bucketed size by repeating its first decision.
-                padded = positions + [positions[0]] * (_round_up(len(positions), self.DECISION_BUCKET) - len(positions))
-                features = _stack_features([states[p].pending.features for p in padded], self.CANDIDATE_BUCKET)
-                if features is not None:
-                    features = {key: self._upload(cohort, value) for key, value in features.items()}
-                index = self._upload(cohort, np.asarray(padded, dtype=np.int64))
-                tokens = self._upload(cohort, np.stack([states[p].readout for p in padded]).astype(np.int64))
-                logits = self.model.policy_logits(hidden[index], head, features, tokens)
-                cohort.launched.append(
-                    ([states[p] for p in positions], logits.float().to("cpu", non_blocking=True))
-                )
+        cohort.launched.extend(
+            launch_policies(
+                self.model, self.device, self.precision, lambda array: self._upload(cohort, array),
+                hidden, states, None,
+            )
+        )
 
     def _receive(self, cohort: _Cohort) -> None:
         """Wait for this cohort's launched policies and hand each state its logits."""
@@ -444,36 +435,74 @@ class SelfPlayCollector:
         cohort.fence = None
 
     def _sample(self, states: list[_Live]) -> None:
-        by_head: dict[str, list[_Live]] = {}
-        for state in states:
-            by_head.setdefault(state.pending.head, []).append(state)
-        for head, group in by_head.items():
-            width = max(state.pending.legal.shape[0] for state in group)
-            logits = np.full((len(group), width), -np.inf, dtype=np.float32)
-            mask = np.zeros((len(group), width), dtype=bool)
-            for row, state in enumerate(group):
-                legal = state.pending.legal
-                logits[row, : legal.shape[0]] = state.logits[: legal.shape[0]]
-                mask[row, : legal.shape[0]] = legal
-            probs = masked_probabilities(logits, mask)
-            uniforms = np.fromiter((state.game.rng.random() for state in group), dtype=np.float64)
-            sampled = sample_rows(probs, mask, uniforms)
-            for row, state in enumerate(group):
-                decision = state.pending
-                actions = decision.legal.shape[0]
-                state.decisions.append(
-                    DecisionRecord(
-                        seat=decision.seat,
-                        head=head,
-                        position=int(state.lengths[decision.seat]) - 1,
-                        action=int(sampled[row]),
-                        probs=probs[row, :actions].astype(np.float32),
-                        features=decision.features,
-                    )
+        self.stats.decisions += sample_decisions(states)
+
+
+DECISION_BUCKET = 16
+CANDIDATE_BUCKET = 8
+
+
+def launch_policies(model, device, precision, upload, hidden, states, context):
+    """Queue each pending decision's head; returns [(states, logits on their way to the host)].
+
+    ``hidden`` [N, d] and ``context`` (None or [N, ...]) are the states'
+    readouts in order. Reads are padded to bucketed decision and candidate
+    counts (MPS compiles a graph per shape) by repeating the first decision.
+    """
+
+    by_head: dict[str, list[int]] = {}
+    for position, state in enumerate(states):
+        by_head.setdefault(state.pending.head, []).append(position)
+    launched = []
+    with autocast_context(device, precision):
+        for head, positions in by_head.items():
+            padded = positions + [positions[0]] * (_round_up(len(positions), DECISION_BUCKET) - len(positions))
+            features = _stack_features([states[p].pending.features for p in padded], CANDIDATE_BUCKET)
+            if features is not None:
+                features = {key: upload(value) for key, value in features.items()}
+            index = upload(np.asarray(padded, dtype=np.int64))
+            tokens = upload(np.stack([states[p].readout for p in padded]).astype(np.int64))
+            logits = model.policy_logits(
+                hidden[index], head, features, tokens, None if context is None else context[index]
+            )
+            launched.append(([states[p] for p in positions], logits.float().to("cpu", non_blocking=True)))
+    return launched
+
+
+def sample_decisions(states, version: int = 0) -> int:
+    """Sample every state's pending decision from its logits; record it. Returns the count."""
+
+    by_head: dict[str, list] = {}
+    for state in states:
+        by_head.setdefault(state.pending.head, []).append(state)
+    for head, group in by_head.items():
+        width = max(state.pending.legal.shape[0] for state in group)
+        logits = np.full((len(group), width), -np.inf, dtype=np.float32)
+        mask = np.zeros((len(group), width), dtype=bool)
+        for row, state in enumerate(group):
+            legal = state.pending.legal
+            logits[row, : legal.shape[0]] = state.logits[: legal.shape[0]]
+            mask[row, : legal.shape[0]] = legal
+        probs = masked_probabilities(logits, mask)
+        uniforms = np.fromiter((state.game.rng.random() for state in group), dtype=np.float64)
+        sampled = sample_rows(probs, mask, uniforms)
+        for row, state in enumerate(group):
+            decision = state.pending
+            actions = decision.legal.shape[0]
+            state.decisions.append(
+                DecisionRecord(
+                    seat=decision.seat,
+                    head=head,
+                    position=int(state.lengths[decision.seat]) - 1,
+                    action=int(sampled[row]),
+                    probs=probs[row, :actions].astype(np.float32),
+                    features=decision.features,
+                    version=version,
                 )
-                state.pending = None
-                state.logits = None
-            self.stats.decisions += len(group)
+            )
+            state.pending = None
+            state.logits = None
+    return len(states)
 
 
 def _stack_features(

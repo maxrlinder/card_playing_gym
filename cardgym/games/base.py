@@ -17,6 +17,7 @@ import torch
 from cardgym.core.dashboard import Panel
 from cardgym.nn.model import SequenceModel
 from cardgym.rl.batch import GameSequences, LabelSpec
+from cardgym.rl.continuous import Lane
 from cardgym.rl.selfplay import SelfPlayGame, Trajectory
 from cardgym.rl.trainer import TrainingHooks
 
@@ -32,15 +33,28 @@ class PolicyModel(SequenceModel):
         head: str,
         features: dict[str, torch.Tensor] | None = None,
         tokens: torch.Tensor | None = None,
+        context: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Logits [N, actions] from readout hidden states [N, d].
 
         ``features`` are the decisions' padded candidate arrays (pointer
         heads); ``tokens`` [N, W] are the readout tokens themselves, so a head
-        can read raw fields (such as a card ledger) at the decision point.
+        can read raw fields (such as a card ledger) at the decision point;
+        ``context`` [N, ...] is the readouts' slice of :meth:`pop_context`.
         """
 
         raise NotImplementedError
+
+    def pop_context(self) -> torch.Tensor | None:
+        """Per-position features [B, T, ...] of the latest forward, handed over once.
+
+        A model whose policy heads reuse something its embedding computed
+        (Rummy's per-card features) keeps it from the forward and returns it
+        here; callers index it like the hidden states. Returning it clears it,
+        so no autograd graph outlives the step that built it.
+        """
+
+        return None
 
     def player_values(self, hidden: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
@@ -91,6 +105,11 @@ class Game(abc.ABC):
     @abc.abstractmethod
     def new_games(self, rng: random.Random, iteration: int) -> list[SelfPlayGame]:
         """One update's schedule of fresh self-play games."""
+
+    def lanes(self, concurrency: float) -> list[Lane]:
+        """Continuous rollout: the game kinds to keep running and each one's per-update quota."""
+
+        raise NotImplementedError(f"{self.name} does not support [rollout] mode = \"continuous\".")
 
     @abc.abstractmethod
     def sequences(self, trajectory: Trajectory) -> GameSequences:

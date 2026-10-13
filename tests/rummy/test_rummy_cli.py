@@ -25,7 +25,10 @@ def test_train_export_evaluate(runs_dir, tmp_path, capsys):
     with open(run / "metrics.csv", newline="") as handle:
         history = list(csv.DictReader(handle))
     assert [int(row["iteration"]) for row in history] == [1, 2]
-    assert abs(float(history[-1]["behavior_kl"])) < 1e-6  # cached rollout == replay
+    # Cached rollout == replay: exact while every decision is fresh (iteration 1);
+    # later updates also train on decisions carried over from older weights.
+    assert abs(float(history[0]["behavior_kl"])) < 1e-6
+    assert float(history[-1]["policy_lag"]) >= 0
     assert float(history[-1]["hands_accuracy"]) > 0
 
     release = tmp_path / "release"

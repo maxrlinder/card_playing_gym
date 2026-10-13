@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import functools
+import math
 import random
 import time
 from dataclasses import dataclass
@@ -14,12 +16,13 @@ import torch
 from cardgym.core.dashboard import Panel
 from cardgym.games.base import Game
 from cardgym.rl.batch import GameSequences
+from cardgym.rl.continuous import Lane
 from cardgym.rl.selfplay import Trajectory
 
 from .engine import EVENT_MELD, EVENT_TAKE, MAX_PLAYERS
 from .model import RummyActor, RummyCritic, RummyModelConfig
 from .selfplay import RummySelfPlay
-from .tokens import F_TYPE, max_stream_length
+from .tokens import max_stream_length
 from .training import ACTOR_LABELS, CRITIC_LABELS, RummyHooks, RummyLossConfig, training_sequences
 
 
@@ -77,16 +80,35 @@ class RummyGame(Game):
     def new_games(self, rng: random.Random, iteration: int) -> list[RummySelfPlay]:
         config = self.game_config
         return [
-            RummySelfPlay(
-                players,
-                hand_size,
-                seed=rng.getrandbits(48),
-                opening_points=config.opening_points,
-                max_turns=config.max_turns,
-            )
+            self.deal(players, hand_size, rng)
             for players in config.player_counts
             for hand_size in config.hand_sizes
             for _ in range(config.games_per_shape)
+        ]
+
+    def deal(self, players: int, hand_size: int, rng: random.Random) -> RummySelfPlay:
+        config = self.game_config
+        return RummySelfPlay(
+            players,
+            hand_size,
+            seed=rng.getrandbits(48),
+            opening_points=config.opening_points,
+            max_turns=config.max_turns,
+        )
+
+    def lanes(self, concurrency: float) -> list[Lane]:
+        config = self.game_config
+        quota = config.games_per_shape
+        return [
+            Lane(
+                name=f"{players}p{hand_size}",
+                players=players,
+                in_flight=max(1, math.ceil(quota * concurrency)),
+                quota=quota,
+                deal=functools.partial(self.deal, players, hand_size),
+            )
+            for players in config.player_counts
+            for hand_size in config.hand_sizes
         ]
 
     def sequences(self, trajectory: Trajectory) -> GameSequences:
@@ -96,21 +118,23 @@ class RummyGame(Game):
         return RummyHooks(self.loss_config, device, precision)
 
     def rollout_summary(self, trajectories: list[Trajectory]) -> dict[str, float]:
-        engines = [trajectory.game.engine for trajectory in trajectories]
-        oracles = [np.stack(trajectory.game.oracle) for trajectory in trajectories]
+        games = [trajectory.game for trajectory in trajectories]
+        engines = [game.engine for game in games]
         draws = sum(decision.head == "draw" for t in trajectories for decision in t.decisions)
-        takes = sum(int((oracle[:, F_TYPE] == EVENT_TAKE).sum()) for oracle in oracles)
-        melds = [int((oracle[:, F_TYPE] == EVENT_MELD).sum()) for oracle in oracles]
-        penalties = [engine.penalties().mean() for engine in engines]
+        takes = sum(event.kind == EVENT_TAKE for game in games for event in game.events)
+        melds = [sum(event.kind == EVENT_MELD for event in game.events) for game in games]
+        tokens = [len(stream) for t in trajectories for stream in t.streams if len(stream)]
         return {
             "win_rate": float(np.mean([engine.winner is not None for engine in engines])),
             "rummy_rate": float(np.mean([engine.rummy for engine in engines])),
             "truncated_rate": float(np.mean([engine.truncated for engine in engines])),
             "turns_per_game": float(np.mean([engine.turns for engine in engines])),
-            "events_per_game": float(np.mean([len(oracle) for oracle in oracles])),
+            "events_per_game": float(np.mean([len(game.events) for game in games])),
+            "tokens_per_stream": float(np.mean(tokens)) if tokens else 0.0,
+            "longest_stream": float(max(tokens, default=0)),
             "take_rate": takes / max(draws, 1),
             "melds_per_game": float(np.mean(melds)),
-            "mean_hand_penalty": float(np.mean(penalties)),
+            "mean_hand_penalty": float(np.mean([engine.penalties().mean() for engine in engines])),
         }
 
     def log_summary(self, summary: dict[str, float]) -> str:
@@ -122,7 +146,7 @@ class RummyGame(Game):
     def dashboard_panels(self) -> list[Panel]:
         return [
             Panel("Round outcome (self-play)", ("win_rate", "rummy_rate", "truncated_rate", "take_rate")),
-            Panel("Round length (self-play)", ("turns_per_game", "melds_per_game")),
+            Panel("Round length (self-play)", ("turns_per_game", "melds_per_game", "tokens_per_stream")),
             Panel("Mean hand penalty at the end", ("mean_hand_penalty",)),
             Panel("Actor auxiliary losses", ("loss_hands", "loss_winner", "loss_penalty")),
             Panel(

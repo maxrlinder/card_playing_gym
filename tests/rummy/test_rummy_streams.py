@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -19,18 +20,33 @@ from cardgym.games.rummy.engine import (
     LOC_TABLE,
     LOC_TOP,
     LOC_UNSEEN,
+    MAX_PLAYERS,
     NUM_LOCATIONS,
+    NUM_MOVERS,
     NUM_PAIRS,
     PAIR,
+    PAIR_LOCATIONS,
+    RummyEngine,
 )
 from cardgym.games.rummy.game import RummyGame, RummyGameConfig
 from cardgym.games.rummy.heuristic import HeuristicPolicy
 from cardgym.games.rummy.model import RummyModelConfig
 from cardgym.games.rummy.selfplay import RummySelfPlay
-from cardgym.games.rummy.tokens import F_CARD, F_NEXT_ACTOR, F_NEXT_PHASE, LEDGER_START
+from cardgym.games.rummy.tokens import (
+    DRAW_ABSENT,
+    DRAW_NONE,
+    DRAW_STOCK,
+    DRAW_TAKE,
+    F_OPP_DISCARD,
+    F_OPP_DRAW,
+    F_OPP_TAKE,
+    F_PHASE,
+    LEDGER_START,
+    LEDGER_VOCAB,
+)
 from cardgym.games.rummy.training import IGNORE, RummyLossConfig, training_sequences
+from cardgym.rl.continuous import ContinuousCollector
 from cardgym.rl.ppo import masked_probabilities
-from cardgym.rl.selfplay import SelfPlayCollector
 from tests.conftest import randomize
 
 # Whether a pair code has a copy the viewer cannot place.
@@ -50,14 +66,21 @@ def heuristic_round(players: int, seed: int, hand_size: int = 13) -> tuple[Rummy
     return game, [np.concatenate(blocks) for blocks in streams]
 
 
-def public_ledgers(game: RummySelfPlay, observer: int) -> np.ndarray:
-    """The observer's copy-location pairs, rebuilt from what it saw (no engine state)."""
+def token_events(game: RummySelfPlay, seat: int) -> list[int]:
+    """Events seen before each of the seat's tokens: one token right before each of its own events."""
+
+    return [index for index, event in enumerate(game.events) if event.actor == seat]
+
+
+def public_pairs(game: RummySelfPlay, observer: int) -> np.ndarray:
+    """The observer's copy-location pairs after 0..E events, rebuilt from what it saw."""
 
     players = game.num_players
-    own = game.hands[0][observer].astype(np.int64).copy()
+    engine = RummyEngine(players, game.hand_size, game.seed)  # the same deal
+    own = engine.hands[observer].copy()
     known = np.zeros((players, NUM_CARDS), dtype=np.int64)
     table = np.zeros(NUM_CARDS, dtype=np.int64)
-    pile = [game.first_discard]
+    pile = [engine.top]
 
     def snapshot() -> np.ndarray:
         counts = np.zeros((NUM_LOCATIONS, NUM_CARDS), dtype=np.int64)
@@ -106,19 +129,53 @@ def test_actor_streams_hold_exactly_public_knowledge():
     for players in (2, 3, 4):
         for seed in range(4):
             game, streams = heuristic_round(players, seed)
-            length = 1 + len(game.events)
             for seat in range(players):
-                stream = streams[seat]
-                assert stream.shape[0] == length
-                ledger = stream[:, LEDGER_START:].astype(np.int64)
-                expected = public_ledgers(game, seat)
-                assert np.array_equal(ledger % NUM_PAIRS, expected)
-                moved = (ledger // NUM_PAIRS) % 2
-                assert not moved[0].any()
-                assert np.array_equal(moved[1:], (expected[1:] != expected[:-1]).astype(np.int64))
-                for position, event in enumerate(game.events, start=1):
-                    if event.kind == EVENT_STOCK and event.actor != seat:
-                        assert stream[position, F_CARD] == NO_CARD
+                stream = streams[seat].astype(np.int64)
+                seen = token_events(game, seat)
+                assert stream.shape[0] == len(seen)  # one token per own decision
+                expected = public_pairs(game, seat)
+                ledger = stream[:, LEDGER_START:]
+                assert np.array_equal(ledger % NUM_PAIRS, expected[seen])
+                # Mover: who last changed each card type (in this view) since the previous token.
+                mover = (ledger // NUM_PAIRS) % NUM_MOVERS
+                previous = 0
+                for token, now in enumerate(seen):
+                    want = np.zeros(NUM_CARDS, dtype=np.int64)
+                    for count in range(previous + 1, now + 1):
+                        changed = expected[count] != expected[count - 1]
+                        want[changed] = 1 + (game.events[count - 1].actor - seat) % players
+                    want[expected[now] == expected[previous]] = 0
+                    assert np.array_equal(mover[token], want)
+                    # The opponents' turns since the previous token.
+                    for offset in range(1, MAX_PLAYERS):
+                        draw = stream[token, F_OPP_DRAW + offset - 1]
+                        taken = stream[token, F_OPP_TAKE + offset - 1]
+                        discard = stream[token, F_OPP_DISCARD + offset - 1]
+                        if offset >= players:
+                            assert draw == DRAW_ABSENT
+                            continue
+                        moves = [e for e in game.events[previous:now] if e.actor == (seat + offset) % players]
+                        draws = [e for e in moves if e.kind in (EVENT_STOCK, EVENT_TAKE)]
+                        discards = [e for e in moves if e.kind == EVENT_DISCARD]
+                        kind = DRAW_NONE if not draws else DRAW_STOCK if draws[-1].kind == EVENT_STOCK else DRAW_TAKE
+                        assert draw == kind
+                        assert taken == (draws[-1].card if draws and draws[-1].kind == EVENT_TAKE else NO_CARD)
+                        assert discard == (discards[-1].card if discards else NO_CARD)
+                    previous = now
+
+
+def test_oracle_streams_see_every_hand():
+    for players in (2, 3, 4):
+        game, streams = heuristic_round(players, seed=5)
+        for seat in range(players):
+            oracle = np.stack(game.oracle[seat]).astype(np.int64)
+            hands = np.stack(game.hands[seat]).astype(np.int64)  # [L, P, 52]
+            assert oracle.shape == streams[seat].shape
+            assert np.array_equal(oracle[:, F_PHASE], streams[seat][:, F_PHASE])
+            locations = PAIR_LOCATIONS[oracle[:, LEDGER_START:] % NUM_PAIRS]  # [L, 52, 2]
+            for offset in range(players):
+                held = (locations == 1 + offset).sum(axis=-1)
+                assert np.array_equal(held, hands[:, (seat + offset) % players])
 
 
 def test_training_sequences_and_belief_masks():
@@ -128,12 +185,12 @@ def test_training_sequences_and_belief_masks():
         def __init__(self, seat, head, position):
             self.seat, self.head, self.position = seat, head, position
 
-    # Rebuild decision addresses: decision i is read at position i.
     decisions = []
-    oracle = np.stack(game.oracle)
-    for position in range(len(game.events)):
-        seat = int(oracle[position, F_NEXT_ACTOR])
-        decisions.append(Record(seat, "draw" if oracle[position, F_NEXT_PHASE] == 0 else "play", position))
+    seen = [0] * game.num_players
+    for event in game.events:
+        head = "draw" if event.kind in (EVENT_STOCK, EVENT_TAKE) else "play"
+        decisions.append(Record(event.actor, head, seen[event.actor]))
+        seen[event.actor] += 1
 
     class Trajectory:
         pass
@@ -142,7 +199,8 @@ def test_training_sequences_and_belief_masks():
     trajectory.game, trajectory.streams, trajectory.decisions = game, streams, decisions
     trajectory.returns = game.returns()
     sequences = training_sequences(trajectory)
-    assert sequences.critic_positions == list(range(len(game.events)))
+    assert sequences.critic_positions == [record.position for record in decisions]
+    assert set(sequences.critic) == set(sequences.actor) == {0, 1, 2}
     for seat, sequence in sequences.actor.items():
         hands = sequence.labels["hands"]
         assert hands.shape == (len(streams[seat]), 3, NUM_CARDS)
@@ -166,24 +224,31 @@ DEVICES = ["cpu"] + (["mps"] if torch.backends.mps.is_available() else [])
 
 
 @pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("cohorts", [1, 2])
-def test_cached_rollout_matches_full_replay(device, cohorts):
-    """Decoding (cached, ragged, cohort-pipelined, async transfers) equals a full replay."""
+def test_continuous_rollout_matches_full_replay(device):
+    """Decoding (cached, gathered rows, refilled slots, carried over) equals a full replay."""
 
     game = tiny_game()
     actor = randomize(game.build_actor().eval(), seed=3, scale=0.2).to(device)
-    collector = SelfPlayCollector(
-        actor, device=torch.device(device), precision="fp32", kv_dtype="fp32", max_rows=64,
-        max_length=game.max_length, cohorts=cohorts,
+    collector = ContinuousCollector(
+        actor, device=torch.device(device), precision="fp32", kv_dtype="fp32", max_length=game.max_length,
     )
-    trajectories = collector.collect(game.new_games(random.Random(0), 0))
-    assert collector.stats.compactions > 0  # games retire out of order
+    lanes = [replace(lane, in_flight=lane.quota + 1) for lane in game.lanes(1.0)]
+    rng = random.Random(0)
+    trajectories = collector.collect(lanes, rng, version=1)
+    carried = collector.in_flight
+    assert len(trajectories) == sum(lane.quota for lane in lanes) and carried > 0
+    trajectories += collector.collect(lanes, rng, version=2)
+    lags = {record.version for trajectory in trajectories for record in trajectory.decisions}
+    assert lags == {1, 2}  # some games straddled the two collections
     worst = 0.0
     with torch.no_grad():
         for trajectory in trajectories:
             for seat, stream in enumerate(trajectory.streams):
+                if not len(stream):
+                    continue
                 tokens = torch.from_numpy(stream.astype(np.int64))[None].to(device)
                 hidden = actor.forward_hidden(tokens)[0]
+                actor.pop_context()
                 for decision in trajectory.decisions:
                     if decision.seat != seat:
                         continue
@@ -202,7 +267,7 @@ def test_card_grid_is_suit_equivariant():
 
     torch.manual_seed(0)
     grid = randomize(tiny_game().build_actor(), seed=1, scale=0.1).embedding.grid.eval()
-    ledger = torch.randint(0, 144, (6, NUM_CARDS))
+    ledger = torch.randint(0, LEDGER_VOCAB, (6, NUM_CARDS))
     permutation = torch.tensor([2, 0, 3, 1])  # new suit of each old suit
     cards = torch.arange(NUM_CARDS)
     moved = permutation[cards // 13] * 13 + cards % 13

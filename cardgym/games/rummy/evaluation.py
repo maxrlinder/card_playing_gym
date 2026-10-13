@@ -7,14 +7,16 @@ position. A lone seat is structurally different from a crowd, so only the two
 directions together say whether the model is better. The headline is the
 model seats' mean relative reward (score minus the mean opponent score).
 
-Decoding reuses the self-play collector: rule-based seats act inside a game's
-``step``, so their events reach the model's streams as ordinary tokens.
+Decoding reuses the continuous collector: rule-based seats act inside a game's
+``step``, and only the model seats' observation tokens reach the decoder.
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
 import random
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -22,34 +24,34 @@ import torch
 
 from cardgym.core.io import atomic_write_json, timestamp
 from cardgym.rl.checkpoint import load_weights
-from cardgym.rl.selfplay import Decision, SelfPlayCollector, SelfPlayGame
+from cardgym.rl.continuous import ContinuousCollector, Lane
+from cardgym.rl.selfplay import Decision, SelfPlayGame
 
 from .heuristic import HeuristicPolicy, RandomPolicy
 from .model import RummyActor, RummyModelConfig
-from .selfplay import RummySelfPlay
+from .selfplay import EMPTY, RummySelfPlay
 from .tokens import max_stream_length
 
 
 class MixedGame(SelfPlayGame):
     """A round in which only ``model_seats`` ask the collector for decisions."""
 
-    def __init__(self, inner: RummySelfPlay, model_seats: frozenset[int], opponent) -> None:
+    def __init__(self, inner: RummySelfPlay, model_seats: frozenset[int], opponent, direction: str) -> None:
         self.inner = inner
         self.num_players = inner.num_players
         self.rng = inner.rng
         self.model_seats = model_seats
         self.opponent = opponent
-        prefix = inner.prefix_tokens()
-        more = self._advance()
-        self._prefix = [np.concatenate([prefix[seat], *more[seat]]) for seat in range(self.num_players)]
+        self.direction = direction
+        self._prefix = self._advance(inner.prefix_tokens())
 
-    def _advance(self) -> list[list[np.ndarray]]:
-        blocks: list[list[np.ndarray]] = [[] for _ in range(self.num_players)]
+    def _advance(self, blocks: list[np.ndarray]) -> list[np.ndarray]:
+        """Let rule-based seats play up to the next model decision; keep only model seats' tokens."""
+
         engine = self.inner.engine
         while not engine.done and engine.current not in self.model_seats:
-            for seat, block in enumerate(self.inner.step(self.opponent.act(engine))):
-                blocks[seat].append(block)
-        return blocks
+            blocks = self.inner.step(self.opponent.act(engine))
+        return [block if seat in self.model_seats else EMPTY for seat, block in enumerate(blocks)]
 
     def lifetime(self) -> int:
         return self.inner.lifetime()
@@ -61,9 +63,7 @@ class MixedGame(SelfPlayGame):
         return self.inner.decision()
 
     def step(self, action: int) -> list[np.ndarray]:
-        first = self.inner.step(action)
-        more = self._advance()
-        return [np.concatenate([first[seat], *more[seat]]) for seat in range(self.num_players)]
+        return self._advance(self.inner.step(action))
 
     def done(self) -> bool:
         return self.inner.done()
@@ -93,13 +93,11 @@ def evaluate(
     precision: str = "fp32",
     opening_points: int = 30,
     max_turns: int = 200,
-    max_rows: int = 4096,
 ) -> dict:
     rng = random.Random(seed)
-    games: list[MixedGame] = []
-    meta: list[tuple[int, str, frozenset[int]]] = []
-    finished: list[tuple[int, str, frozenset[int], np.ndarray, RummySelfPlay]] = []
+    lanes: list[Lane] = []
     for players in player_counts:
+        games: deque[MixedGame] = deque()
         for _ in range(deals):
             deal_seed = rng.getrandbits(48)
             for lone in range(players):
@@ -109,25 +107,35 @@ def evaluate(
                     inner = RummySelfPlay(
                         players, hand_size, seed=deal_seed, opening_points=opening_points, max_turns=max_turns
                     )
-                    game = MixedGame(inner, seats, policy)
-                    if game.done():
-                        finished.append((players, direction, seats, game.returns(), inner))
-                    else:
-                        games.append(game)
-                        meta.append((players, direction, seats))
-    collector = SelfPlayCollector(
+                    games.append(MixedGame(inner, seats, policy, direction))
+        lanes.append(
+            Lane(
+                name=f"{players}p",
+                players=players,
+                in_flight=len(games),
+                quota=None,
+                deal=functools.partial(_next_game, games),
+            )
+        )
+    collector = ContinuousCollector(
         actor,
         device=device,
         precision=precision,
         kv_dtype=precision,
-        max_rows=max_rows,
         max_length=max_stream_length(max_turns),
     )
-    trajectories = collector.collect(games)
-    collector.release()
-    for (players, direction, seats), trajectory, game in zip(meta, trajectories, games):
-        finished.append((players, direction, seats, trajectory.returns, game.inner))
+    trajectories = collector.collect(lanes, rng)
+    collector.reset()
+    finished = [
+        (game.num_players, game.direction, game.model_seats, trajectory.returns, game.inner)
+        for trajectory in trajectories
+        for game in [trajectory.game]
+    ]
     return report(finished, player_counts)
+
+
+def _next_game(games: deque, rng: random.Random) -> MixedGame | None:
+    return games.popleft() if games else None
 
 
 def _directions(players: int) -> tuple[str, ...]:
@@ -148,7 +156,7 @@ def report(finished, player_counts: tuple[int, ...]) -> dict:
                 engine = inner.engine
                 wins += engine.winner is not None
                 model_wins += engine.winner in seats
-                lengths.append(len(inner.oracle))
+                lengths.append(len(inner.events))
                 truncated += engine.truncated
             n = len(rewards)
             entry[direction] = {

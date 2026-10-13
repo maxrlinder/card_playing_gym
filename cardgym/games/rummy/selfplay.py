@@ -1,4 +1,4 @@
-"""Rummy rounds as self-play games for the shared collector.
+"""Rummy rounds as self-play games for the shared collectors.
 
 Each decision's legal actions go to the policy as a candidate list (a pointer
 head): per candidate its kind, the cards it moves out of the hand (or, for a
@@ -17,9 +17,10 @@ from cardgym.rl.selfplay import Decision, SelfPlayGame
 from .cards import NO_CARD
 from .engine import DRAW, LAYOFF_GROUP, LAYOFF_RUN, MELD_GROUP, MELD_RUN, Action, Event, RummyEngine
 from .melds import MELD_CARDS
-from .tokens import StreamWriter
+from .tokens import WIDTH, ObservationWriter
 
 MAX_MELD_CARDS = 13
+EMPTY = np.zeros((0, WIDTH), dtype=np.int16)
 
 
 def candidate_features(engine: RummyEngine, actions: list[Action]) -> dict[str, np.ndarray]:
@@ -47,8 +48,11 @@ def head_of(engine: RummyEngine) -> str:
 class RummySelfPlay(SelfPlayGame):
     """One round, every seat played by the policy being trained.
 
-    Besides the observer streams it records what training needs: the oracle
-    stream and every seat's true hand after each event.
+    Only the seat about to decide receives a token (its observation), so each
+    step returns one block for the next actor and empty blocks for everyone
+    else. Besides the actor streams it records what training needs: each
+    seat's oracle stream (same positions) and the true hands at each of its
+    tokens.
     """
 
     def __init__(
@@ -62,21 +66,31 @@ class RummySelfPlay(SelfPlayGame):
     ) -> None:
         self.num_players = num_players
         self.hand_size = hand_size
+        self.seed = seed
         self.engine = RummyEngine(
             num_players, hand_size, seed, opening_points=opening_points, max_turns=max_turns
         )
         self.rng = random.Random(seed ^ 0x5EED)
-        self.writer = StreamWriter(self.engine)
-        deal = self.writer.deal().astype(np.int16)
-        self.oracle: list[np.ndarray] = [deal[num_players]]
-        self.hands: list[np.ndarray] = [self.engine.hands.astype(np.int8)]
-        self.first_discard = self.engine.top
+        self.writer = ObservationWriter(self.engine)
+        self.oracle: list[list[np.ndarray]] = [[] for _ in range(num_players)]
+        self.hands: list[list[np.ndarray]] = [[] for _ in range(num_players)]
         self.events: list[Event] = []
-        self._prefix = [deal[seat][None] for seat in range(num_players)]
         self._decision: Decision | None = None
+        self._prefix = self._observe()
 
     def lifetime(self) -> int:
         return len(self.engine.stock)
+
+    def _observe(self) -> list[np.ndarray]:
+        blocks = [EMPTY] * self.num_players
+        engine = self.engine
+        if not engine.done:
+            seat = engine.current
+            token, oracle = self.writer.observe(seat)
+            self.oracle[seat].append(oracle)
+            self.hands[seat].append(engine.hands.astype(np.int8))
+            blocks[seat] = token[None]
+        return blocks
 
     def prefix_tokens(self) -> list[np.ndarray]:
         return self._prefix
@@ -96,12 +110,10 @@ class RummySelfPlay(SelfPlayGame):
     def step(self, action: int) -> list[np.ndarray]:
         engine = self.engine
         event = engine.apply(engine.candidates()[action])
+        self.writer.record(event)
         self.events.append(event)
         self._decision = None
-        rows = self.writer.event(event).astype(np.int16)
-        self.oracle.append(rows[self.num_players])
-        self.hands.append(engine.hands.astype(np.int8))
-        return [rows[seat][None] for seat in range(self.num_players)]
+        return self._observe()
 
     def done(self) -> bool:
         return self.engine.done

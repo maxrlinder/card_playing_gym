@@ -15,6 +15,7 @@ from cardgym.games.base import Game
 from cardgym.nn.metal_trunk import metal_trunk_requested, unsupported_reason
 
 from .config import PPOConfig, RolloutConfig, RunConfig
+from .continuous import ContinuousCollector
 from .selfplay import SelfPlayCollector
 from .trainer import PPOTrainer
 
@@ -76,7 +77,7 @@ class Components:
     config: ResolvedConfig
     device: torch.device
     trainer: PPOTrainer
-    collector: SelfPlayCollector
+    collector: SelfPlayCollector | ContinuousCollector
 
 
 def build_components(config: ResolvedConfig, *, device: str | None = None) -> Components:
@@ -102,15 +103,24 @@ def build_components(config: ResolvedConfig, *, device: str | None = None) -> Co
         for model, length in ((trainer.actor, game.max_length), (trainer.critic, game.critic_max_length)):
             if unsupported_reason(model.trunk_config, length) is None:
                 model.enable_metal_trunk(length)
-    collector = SelfPlayCollector(
-        trainer.actor,
-        device=target,
-        precision=config.run.precision,
-        kv_dtype=config.rollout.kv_dtype,
-        max_rows=config.rollout.max_rows,
-        max_length=game.max_length,
-        cohorts=config.rollout.cohorts,
-    )
+    if config.rollout.mode == "continuous":
+        collector = ContinuousCollector(
+            trainer.actor,
+            device=target,
+            precision=config.run.precision,
+            kv_dtype=config.rollout.kv_dtype,
+            max_length=game.max_length,
+        )
+    else:
+        collector = SelfPlayCollector(
+            trainer.actor,
+            device=target,
+            precision=config.run.precision,
+            kv_dtype=config.rollout.kv_dtype,
+            max_rows=config.rollout.max_rows,
+            max_length=game.max_length,
+            cohorts=config.rollout.cohorts,
+        )
     return Components(config=config, device=target, trainer=trainer, collector=collector)
 
 

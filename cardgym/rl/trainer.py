@@ -276,7 +276,11 @@ class PPOTrainer:
                         continue
                     seq = rows.critic_seq[selected] - start
                     pos = rows.critic_position[selected]
-                    seat_values = values_np[seq, pos]
+                    # Absolute seat i sits at column (i - shift) mod players.
+                    players = group.player_counts[start:stop][seq][:, None]
+                    seats = np.arange(self.max_players)[None, :]
+                    columns = (seats - rows.critic_shift[selected][:, None]) % players
+                    seat_values = np.take_along_axis(values_np[seq, pos], columns, axis=1) * (seats < players)
                     predictions[head][selected] = seat_values[np.arange(selected.size), rows.seat[selected]]
                     if gae:
                         state_values.setdefault(head, np.zeros((len(rows), self.max_players)))
@@ -327,10 +331,8 @@ class PPOTrainer:
         for game, items in entries.items():
             items.sort()
             values = np.stack([state_values[head][row] for _, head, row in items])
-            first_head, first_row = items[0][1], items[0][2]
-            rows0 = batch.decisions[first_head]
-            group = batch.critic_groups[int(rows0.critic_group[first_row])]
-            returns = group.returns[int(rows0.critic_seq[first_row])].astype(np.float64)
+            returns = np.zeros(self.max_players)
+            returns[: batch.game_returns[game].shape[0]] = batch.game_returns[game]
             advantages = gae_advantages(values, returns, self.config.gae_lambda)
             for state, (_, head, row) in enumerate(items):
                 rows = batch.decisions[head]
@@ -368,6 +370,7 @@ class PPOTrainer:
                         hidden = dual.hidden
                     else:
                         hidden = self.actor.forward_hidden(tokens)
+                context = self.actor.pop_context()
                 dense = self._dense_rows(group, start, stop)
                 auxiliary = torch.zeros((), device=self.device)
                 hooked = self.hooks.actor_auxiliary(self.actor, hidden, dense, group, totals)
@@ -382,7 +385,7 @@ class PPOTrainer:
                     selected = indexes[head].select(group_index, start, stop)
                     if selected.size:
                         policy = policy + self._policy_loss(
-                            hidden, tokens, rows, selected, start, head, alpha[head], totals
+                            hidden, tokens, context, rows, selected, start, head, alpha[head], totals
                         )
                 self._backward(auxiliary, policy, dual)
 
@@ -390,6 +393,7 @@ class PPOTrainer:
         self,
         hidden: torch.Tensor,
         tokens: torch.Tensor,
+        context: torch.Tensor | None,
         rows: DecisionRows,
         selected: np.ndarray,
         start: int,
@@ -405,7 +409,9 @@ class PPOTrainer:
             else {key: torch.from_numpy(value[selected]).to(self.device) for key, value in rows.features.items()}
         )
         with autocast_context(self.device, self.precision):
-            logits = self.actor.policy_logits(hidden[seq, pos], head, features, tokens[seq, pos])
+            logits = self.actor.policy_logits(
+                hidden[seq, pos], head, features, tokens[seq, pos], None if context is None else context[seq, pos]
+            )
         old_probs = torch.from_numpy(rows.probs[selected]).to(self.device)
         logits = logits.float()[:, : old_probs.shape[1]]
         terms = ppo_terms(

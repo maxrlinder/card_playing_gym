@@ -66,11 +66,12 @@ class SequenceModel(nn.Module):
         cache: KVCache,
         readout_offsets: torch.Tensor,
         span: int | None = None,
+        rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Append a padded run per cache row 0..B-1; hidden at each readout [B, d]."""
+        """Append a padded run per cache row 0..B-1 (or ``rows``); hidden at each readout [B, d]."""
 
         return self.trunk.forward_ragged(
-            *self.prepare(tokens), cache, positions, readout_offsets, span
+            *self.prepare(tokens), cache, positions, readout_offsets, span, rows
         )
 
     def new_cache(

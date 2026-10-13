@@ -206,7 +206,7 @@ class PlumpActor(PolicyModel):
         bias = self.card_rank_bias[self.card_ranks] + self.card_suit_bias[self.card_suits]
         return F.linear(hidden, weight, bias)
 
-    def policy_logits(self, hidden, head, features=None, tokens=None):
+    def policy_logits(self, hidden, head, features=None, tokens=None, context=None):
         if head == "bid":
             return self.bid_head(hidden)
         if head == "play":
