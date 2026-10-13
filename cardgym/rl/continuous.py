@@ -178,9 +178,17 @@ class ContinuousCollector:
         return True
 
     def _deal(self, slot: _Slot, lanes: list[Lane], rng: random.Random) -> None:
-        """Fill an empty slot; games that end before any decision finish at once."""
+        """Fill an empty slot; games that end before any decision finish at once.
+
+        A lane whose finished games already cover its quota deals nothing:
+        a collection runs until the slowest lane meets its quota, and a lane
+        with shorter games would otherwise bank surplus games every time,
+        each returned later and older (policy lag grew to 5+ versions).
+        """
 
         lane = lanes[slot.lane]
+        if lane.quota is not None and len(self._finished[lane.name]) >= lane.quota:
+            return
         while True:
             game = lane.deal(rng)
             if game is None:
