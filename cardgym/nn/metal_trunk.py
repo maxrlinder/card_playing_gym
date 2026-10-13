@@ -50,10 +50,8 @@ from torch.optim.optimizer import register_optimizer_step_post_hook
 from .trunk import TrunkConfig
 
 ENV_FLAG = "CARDGYM_METAL_TRUNK"
-# Threadgroup memory on Apple GPUs is 32 KB; attention keeps K and V for a
-# whole sequence there as fp32.
-_THREADGROUP_BYTES = 32 * 1024
-MAX_LENGTH = 128
+# Sequences of any length: attention tiles keys through threadgroup memory.
+MAX_LENGTH = 1 << 16
 _LN_THREADGROUPS = 128
 _LN_SIMDGROUPS = 8
 _GELU_ROWS = 32
@@ -64,25 +62,34 @@ def metal_trunk_requested() -> bool:
     return os.environ.get(ENV_FLAG, "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def unsupported_reason(config: TrunkConfig, max_length: int) -> str | None:
+def _block(group: int, head_dim: int) -> int:
+    """Query/key positions per attention threadgroup (and keys per tile).
+
+    A threadgroup runs one thread per (query head in the group, position) and
+    holds two fp32 tiles of ``block * head_dim`` (16 KB at 64 x 32).
+    """
+
+    block = 64 if head_dim <= 32 else 32
+    while group * block > 1024:
+        block //= 2
+    return block
+
+
+def unsupported_reason(config: TrunkConfig, max_length: int | None = None) -> str | None:
     """Why this trunk cannot use the fused kernels, or None when it can.
 
-    ``max_length`` is the longest sequence the model will ever see (actor or
-    critic stream).
+    Any sequence length is supported; ``max_length`` is accepted for callers
+    that still pass it.
     """
 
     if config.per_layer_dim not in (0, 64):
         return "per-layer embeddings must be 64 wide (or off)"
     if config.per_layer_dim and config.d_model < 64:
         return "d_model must be at least the per-layer embedding width"
-    group = config.n_heads // config.n_kv_heads
-    if group * MAX_LENGTH > 1024:
-        return "query heads per KV head exceed one threadgroup"
-    attention_bytes = 4 * (2 * MAX_LENGTH * config.head_dim + group * MAX_LENGTH)
-    if attention_bytes > _THREADGROUP_BYTES:
-        return "head_dim too large for threadgroup-resident K/V"
-    if max_length > MAX_LENGTH:
-        return f"sequences longer than {MAX_LENGTH}"
+    if config.head_dim > 64:
+        return "head_dim above 64"
+    if _block(config.n_heads // config.n_kv_heads, config.head_dim) < 8:
+        return "too many query heads per KV head"
     return None
 
 
@@ -99,7 +106,13 @@ constant constexpr int KVH = {kv_heads};
 constant constexpr int NH = {n_heads};
 constant constexpr int G = NH / KVH;
 constant constexpr int QKV_W = (NH + 2 * KVH) * D;
-constant constexpr int MAXL = {MAX_LENGTH};
+constant constexpr int BQ = {_block(n_heads // kv_heads, head_dim)};
+constant constexpr int BK = BQ;
+constant constexpr int TK = {_block(n_heads // kv_heads, head_dim)};
+constant constexpr int TQ = 32;
+// The dk/dv kernel's threadgroup region: query tiles (bf16) plus lse/delta,
+// later reused as the fp32 dk/dv reduction scratch.
+constant constexpr int DKV_FLOATS = (G * TQ * D + 2 * G * TQ) > (2 * BK * D) ? (G * TQ * D + 2 * G * TQ) : (2 * BK * D);
 constant constexpr int K_OFF = NH * D;
 constant constexpr int V_OFF = NH * D + KVH * D;
 
@@ -304,8 +317,10 @@ kernel void gelu_bwd(
     }}
 }}
 
-// Causal GQA attention forward. One threadgroup per (sequence, KV head);
-// thread (g, t) is query head j * G + g at position t.
+// Causal GQA attention forward, tiled. One threadgroup per (sequence, KV
+// head, block of BQ query positions); thread (g, t) is query head j * G + g
+// at position qb * BQ + t. Keys stream through threadgroup memory in tiles of
+// TK, so the sequence length is unbounded.
 // qkv [B, L, QKV_W] bf16; vemb [B, L, ve_stride] fp32 sliced at ve_off
 // (ve_off < 0: no value embedding); out [B, L, NH*D] bf16;
 // lse [B, NH, L] fp32 in log2 units.
@@ -322,62 +337,157 @@ kernel void attn_fwd(
     uint tid [[thread_position_in_threadgroup]],
     uint tgsize [[threads_per_threadgroup]])
 {{
-    threadgroup float Ks[MAXL * D];
-    threadgroup float Vs[MAXL * D];
-    const int b = tg / KVH;
-    const int j = tg % KVH;
+    threadgroup float Ks[TK * D];
+    threadgroup float Vs[TK * D];
+    const int blocks = (L + BQ - 1) / BQ;
+    const int qb = tg % blocks;
+    const int j = (tg / blocks) % KVH;
+    const int b = tg / (blocks * KVH);
     const long base = (long)b * L;
-    for (int i = tid; i < L * D; i += tgsize) {{
-        const int s = i / D, d = i % D;
-        const long row = (base + s) * QKV_W;
-        Ks[i] = float(qkv[row + K_OFF + j * D + d]);
-        float v = float(qkv[row + V_OFF + j * D + d]);
-        if (ve_off >= 0) {{
-            // Autocast adds the fp32 embedding to the bf16 projection and
-            // SDPA then reads v in bf16: round exactly once, here.
-            v = float(bfloat(v + vemb[(base + s) * ve_stride + ve_off + j * D + d]));
-        }}
-        Vs[i] = v;
-    }}
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const int g = tid / L;
-    const int t = tid % L;
-    if (g >= G) return;
-    const int h = j * G + g;
+    const int g = tid / BQ;
+    const int t = qb * BQ + (int)(tid % BQ);
+    const bool active = g < G && t < L;
+    const int h = j * G + min(g, G - 1);
+    const int tq = min(t, L - 1);
     float q[D];
-    const long qrow = (base + t) * QKV_W + h * D;
+    const long qrow = (base + tq) * QKV_W + h * D;
     for (int d = 0; d < D; ++d) q[d] = float(qkv[qrow + d]) * scale_log2;
     float m = -INFINITY, l = 0.0f;
     float acc[D];
     for (int d = 0; d < D; ++d) acc[d] = 0.0f;
-    for (int s = 0; s <= t; ++s) {{
-        float score = 0.0f;
-        for (int d = 0; d < D; ++d) score = fma(q[d], Ks[s * D + d], score);
-        const float m_new = max(m, score);
-        const float corr = exp2(m - m_new);
-        const float p = exp2(score - m_new);
-        l = l * corr + p;
-        for (int d = 0; d < D; ++d) acc[d] = fma(p, Vs[s * D + d], acc[d] * corr);
-        m = m_new;
+    const int last = min(L, (qb + 1) * BQ);  // keys this block can see
+    for (int k0 = 0; k0 < last; k0 += TK) {{
+        const int width = min(TK, last - k0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int i = tid; i < width * D; i += tgsize) {{
+            const int s = k0 + i / D, d = i % D;
+            const long row = (base + s) * QKV_W;
+            Ks[i] = float(qkv[row + K_OFF + j * D + d]);
+            float v = float(qkv[row + V_OFF + j * D + d]);
+            if (ve_off >= 0) {{
+                // Autocast adds the fp32 embedding to the bf16 projection and
+                // SDPA then reads v in bf16: round exactly once, here.
+                v = float(bfloat(v + vemb[(base + s) * ve_stride + ve_off + j * D + d]));
+            }}
+            Vs[i] = v;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const int stop = min(width, t - k0 + 1);
+        for (int i = 0; i < stop; ++i) {{
+            float score = 0.0f;
+            for (int d = 0; d < D; ++d) score = fma(q[d], Ks[i * D + d], score);
+            const float m_new = max(m, score);
+            const float corr = exp2(m - m_new);
+            const float p = exp2(score - m_new);
+            l = l * corr + p;
+            for (int d = 0; d < D; ++d) acc[d] = fma(p, Vs[i * D + d], acc[d] * corr);
+            m = m_new;
+        }}
     }}
+    if (!active) return;
     const float inv = 1.0f / l;
     const long orow = (base + t) * (NH * D) + h * D;
     for (int d = 0; d < D; ++d) out[orow + d] = bfloat(acc[d] * inv);
     lse[((long)b * NH + h) * L + t] = m + log2(l);
 }}
 
-// Attention backward for one cotangent stream per threadgroup; SL streams
-// are interleaved per row in dout [B, L, SL, NH*D] and dqkv [B, L, SL, QKV_W].
-// The v gradient also lands in dvemb [B, L, SL, dve_stride] at ve_off, which
-// is the value-embedding table's gradient. Two streams in one threadgroup
-// would share the probabilities but double the per-thread accumulators, and
-// measured slower: the spills cost more than the shared exp2.
-kernel void attn_bwd(
+// Attention backward, part 1: dq and delta = dout . out, tiled like the
+// forward. One threadgroup per (cotangent stream, sequence, KV head, query
+// block); SL streams are interleaved per row in dout [B, L, SL, NH*D] and
+// dqkv [B, L, SL, QKV_W]; delta [SL, B, NH, L] feeds part 2.
+kernel void attn_bwd_dq(
     device const bfloat* qkv [[buffer(0)]],
     device const float* vemb [[buffer(1)]],
     device const bfloat* out [[buffer(2)]],
     device const float* lse [[buffer(3)]],
     device const bfloat* dout [[buffer(4)]],
+    device bfloat* dqkv [[buffer(5)]],
+    device float* delta [[buffer(6)]],
+    constant int& L [[buffer(7)]],
+    constant int& ve_stride [[buffer(8)]],
+    constant int& ve_off [[buffer(9)]],
+    constant float& scale_log2 [[buffer(10)]],
+    constant float& scale [[buffer(11)]],
+    constant int& B [[buffer(12)]],
+    constant int& SL [[buffer(13)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgsize [[threads_per_threadgroup]])
+{{
+    threadgroup float Ks[TK * D];
+    threadgroup float Vs[TK * D];
+    const int blocks = (L + BQ - 1) / BQ;
+    const int qb = tg % blocks;
+    const int j = (tg / blocks) % KVH;
+    const int b = (tg / (blocks * KVH)) % B;
+    const int so = tg / (blocks * KVH * B);
+    dout += so * (NH * D);
+    dqkv += so * QKV_W;
+    const long base = (long)b * L;
+    const int g = tid / BQ;
+    const int t = qb * BQ + (int)(tid % BQ);
+    const bool active = g < G && t < L;
+    const int h = j * G + min(g, G - 1);
+    const int tq = min(t, L - 1);
+    const float lse_t = lse[((long)b * NH + h) * L + tq];
+    float q[D], dov[D], dq[D];
+    const long qrow = (base + tq) * QKV_W + h * D;
+    const long drow = ((base + tq) * SL) * (NH * D) + h * D;
+    const long orow = (base + tq) * (NH * D) + h * D;
+    float dl = 0.0f;
+    for (int d = 0; d < D; ++d) {{
+        q[d] = float(qkv[qrow + d]) * scale_log2;
+        dov[d] = float(dout[drow + d]);
+        dl = fma(dov[d], float(out[orow + d]), dl);
+        dq[d] = 0.0f;
+    }}
+    const int last = min(L, (qb + 1) * BQ);
+    for (int k0 = 0; k0 < last; k0 += TK) {{
+        const int width = min(TK, last - k0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int i = tid; i < width * D; i += tgsize) {{
+            const int s = k0 + i / D, d = i % D;
+            const long row = (base + s) * QKV_W;
+            Ks[i] = float(qkv[row + K_OFF + j * D + d]);
+            float v = float(qkv[row + V_OFF + j * D + d]);
+            if (ve_off >= 0) {{
+                v = float(bfloat(v + vemb[(base + s) * ve_stride + ve_off + j * D + d]));
+            }}
+            Vs[i] = v;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const int stop = min(width, t - k0 + 1);
+        for (int i = 0; i < stop; ++i) {{
+            float score = 0.0f, dp = 0.0f;
+            for (int d = 0; d < D; ++d) {{
+                score = fma(q[d], Ks[i * D + d], score);
+                dp = fma(dov[d], Vs[i * D + d], dp);
+            }}
+            const float ds = exp2(score - lse_t) * (dp - dl);
+            for (int d = 0; d < D; ++d) dq[d] = fma(ds, Ks[i * D + d], dq[d]);
+        }}
+    }}
+    if (!active) return;
+    delta[(((long)so * B + b) * NH + h) * L + t] = dl;
+    const long dqrow = ((base + t) * SL) * QKV_W + h * D;
+    for (int d = 0; d < D; ++d) dqkv[dqrow + d] = bfloat(dq[d] * scale);
+}}
+
+// Attention backward, part 2: dk and dv. One threadgroup per (stream,
+// sequence, KV head, block of BK keys); thread (g, s) sums query head
+// j * G + g's share of key s's gradients over the queries that see it, then
+// the G shares are reduced in threadgroup memory. Queries stream through
+// threadgroup memory in tiles of TQ rows for all G heads (bf16, exact: q and
+// dout are bf16 already), so the 32 threads of a SIMD group, which share g,
+// read one broadcast row per step. The tile region is reused for the
+// reduction. The v gradient also lands in dvemb [B, L, SL, dve_stride] at
+// ve_off, the value-embedding gradient.
+kernel void attn_bwd_dkv(
+    device const bfloat* qkv [[buffer(0)]],
+    device const float* vemb [[buffer(1)]],
+    device const float* lse [[buffer(2)]],
+    device const bfloat* dout [[buffer(3)]],
+    device const float* delta [[buffer(4)]],
     device bfloat* dqkv [[buffer(5)]],
     device float* dvemb [[buffer(6)]],
     constant int& L [[buffer(7)]],
@@ -392,116 +502,93 @@ kernel void attn_bwd(
     uint tid [[thread_position_in_threadgroup]],
     uint tgsize [[threads_per_threadgroup]])
 {{
-    threadgroup float Ks[MAXL * D];
-    threadgroup float Vs[MAXL * D];
-    threadgroup float Dl[G * MAXL];
-    const int so = tg / (B * KVH);
-    const int b = (tg / KVH) % B;
-    const int j = tg % KVH;
+    threadgroup float buf[DKV_FLOATS];
+    threadgroup bfloat* Qs = (threadgroup bfloat*)buf;  // [G][TQ][D]
+    threadgroup bfloat* Os = Qs + G * TQ * D;           // [G][TQ][D]
+    threadgroup float* Ls = buf + G * TQ * D;           // [G][TQ]
+    threadgroup float* Dls = Ls + G * TQ;               // [G][TQ]
+    const int blocks = (L + BK - 1) / BK;
+    const int kb = tg % blocks;
+    const int j = (tg / blocks) % KVH;
+    const int b = (tg / (blocks * KVH)) % B;
+    const int so = tg / (blocks * KVH * B);
     dout += so * (NH * D);
     dqkv += so * QKV_W;
     dvemb += so * dve_stride;
     const long base = (long)b * L;
-    for (int i = tid; i < L * D; i += tgsize) {{
-        const int s = i / D, d = i % D;
-        const long row = (base + s) * QKV_W;
-        Ks[i] = float(qkv[row + K_OFF + j * D + d]);
-        float v = float(qkv[row + V_OFF + j * D + d]);
-        if (ve_off >= 0) {{
-            v = float(bfloat(v + vemb[(base + s) * ve_stride + ve_off + j * D + d]));
-        }}
-        Vs[i] = v;
-    }}
-    const bool active = tid < (uint)(G * L);
-    // Inactive lanes alias the last real (g, t) so every address stays
-    // valid; nothing they compute is stored.
-    const int lin = active ? (int)tid : G * L - 1;
-    const int g = lin / L;
-    const int t = lin % L;
-    const int h = j * G + g;
-    const float lse_t = lse[((long)b * NH + h) * L + t];
-    {{
-        const long orow = (base + t) * (NH * D) + h * D;
-        const long drow = ((base + t) * SL) * (NH * D) + h * D;
-        float delta = 0.0f;
-        for (int d = 0; d < D; ++d) delta = fma(float(dout[drow + d]), float(out[orow + d]), delta);
-        if (active) Dl[g * L + t] = delta;
-    }}
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Phase 1: dq for query (g, t).
-    {{
-        float q[D], dov[D], dq[D];
-        const long qrow = (base + t) * QKV_W + h * D;
-        const long drow = ((base + t) * SL) * (NH * D) + h * D;
-        for (int d = 0; d < D; ++d) {{
-            q[d] = float(qkv[qrow + d]) * scale_log2;
-            dov[d] = float(dout[drow + d]);
-            dq[d] = 0.0f;
-        }}
-        const float delta = Dl[g * L + t];
-        for (int s = 0; s <= t; ++s) {{
-            float score = 0.0f, dp = 0.0f;
-            for (int d = 0; d < D; ++d) {{
-                score = fma(q[d], Ks[s * D + d], score);
-                dp = fma(dov[d], Vs[s * D + d], dp);
-            }}
-            const float ds = exp2(score - lse_t) * (dp - delta);
-            for (int d = 0; d < D; ++d) dq[d] = fma(ds, Ks[s * D + d], dq[d]);
-        }}
-        if (active) {{
-            const long dqrow = ((base + t) * SL) * QKV_W + h * D;
-            for (int d = 0; d < D; ++d) dqkv[dqrow + d] = bfloat(dq[d] * scale);
-        }}
-    }}
-
-    // Phase 2: this query head's share of dk/dv for key s = t.
-    const int s = t;
+    const int g = tid / BK;
+    const int sl = tid % BK;
+    const int s = kb * BK + sl;
+    const bool active = g < G && s < L;
+    const int gq = min(g, G - 1);
+    const int sk = min(s, L - 1);
     float k[D], v[D], dk[D], dv[D];
+    const long krow = (base + sk) * QKV_W;
     for (int d = 0; d < D; ++d) {{
-        k[d] = Ks[s * D + d];
-        v[d] = Vs[s * D + d];
+        k[d] = float(qkv[krow + K_OFF + j * D + d]);
+        float vv = float(qkv[krow + V_OFF + j * D + d]);
+        if (ve_off >= 0) vv = float(bfloat(vv + vemb[(base + sk) * ve_stride + ve_off + j * D + d]));
+        v[d] = vv;
         dk[d] = 0.0f;
         dv[d] = 0.0f;
     }}
-    for (int tq = s; tq < L; ++tq) {{
-        const long qrow = (base + tq) * QKV_W + h * D;
-        const long drow = ((base + tq) * SL) * (NH * D) + h * D;
-        float qv[D], dot[D];
-        float score = 0.0f, dp = 0.0f;
-        for (int d = 0; d < D; ++d) {{
-            qv[d] = float(qkv[qrow + d]) * scale_log2;
-            dot[d] = float(dout[drow + d]);
-            score = fma(qv[d], k[d], score);
-            dp = fma(dot[d], v[d], dp);
+    for (int q0 = kb * BK; q0 < L; q0 += TQ) {{
+        const int width = min(TQ, L - q0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int i = tid; i < G * width * D; i += tgsize) {{
+            const int gg = i / (width * D), rem = i % (width * D);
+            const int ti = rem / D, d = rem % D;
+            const int hh = j * G + gg;
+            const long row = base + q0 + ti;
+            Qs[(gg * TQ + ti) * D + d] = qkv[row * QKV_W + hh * D + d];
+            Os[(gg * TQ + ti) * D + d] = dout[(row * SL) * (NH * D) + hh * D + d];
         }}
-        const float p = exp2(score - lse[((long)b * NH + h) * L + tq]);
-        const float ds = p * (dp - Dl[g * L + tq]);
-        for (int d = 0; d < D; ++d) {{
-            dv[d] = fma(p, dot[d], dv[d]);
-            dk[d] = fma(ds, qv[d], dk[d]);
+        for (int i = tid; i < G * width; i += tgsize) {{
+            const int gg = i / width, ti = i % width;
+            const int hh = j * G + gg;
+            Ls[gg * TQ + ti] = lse[((long)b * NH + hh) * L + q0 + ti];
+            Dls[gg * TQ + ti] = delta[(((long)so * B + b) * NH + hh) * L + q0 + ti];
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (active) {{
+            threadgroup const bfloat* Qg = Qs + gq * TQ * D;
+            threadgroup const bfloat* Og = Os + gq * TQ * D;
+            for (int i = max(0, s - q0); i < width; ++i) {{
+                float score = 0.0f, dp = 0.0f;
+                for (int d = 0; d < D; ++d) {{
+                    score = fma(float(Qg[i * D + d]), k[d], score);
+                    dp = fma(float(Og[i * D + d]), v[d], dp);
+                }}
+                const float p = exp2(score * scale_log2 - Ls[gq * TQ + i]);
+                const float ds = p * (dp - Dls[gq * TQ + i]);
+                for (int d = 0; d < D; ++d) {{
+                    dv[d] = fma(p, float(Og[i * D + d]), dv[d]);
+                    dk[d] = fma(ds, float(Qg[i * D + d]), dk[d]);
+                }}
+            }}
         }}
     }}
-    // Reduce over the G query heads in the (now free) K/V tiles.
+    threadgroup float* dKs = buf;
+    threadgroup float* dVs = buf + BK * D;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int i = tid; i < L * D; i += tgsize) {{ Ks[i] = 0.0f; Vs[i] = 0.0f; }}
+    for (int i = tid; i < BK * D; i += tgsize) {{ dKs[i] = 0.0f; dVs[i] = 0.0f; }}
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int gg = 0; gg < G; ++gg) {{
         if (active && g == gg) {{
             for (int d = 0; d < D; ++d) {{
-                Ks[s * D + d] += dk[d];
-                Vs[s * D + d] += dv[d];
+                dKs[sl * D + d] += dk[d];
+                dVs[sl * D + d] += dv[d];
             }}
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }}
-    // dk was accumulated against q * scale * log2(e); its true factor is scale.
-    const float k_scale = scale / scale_log2;
-    for (int i = tid; i < L * D; i += tgsize) {{
-        const int ss = i / D, d = i % D;
+    // dk was accumulated against the unscaled q; its true factor is scale.
+    const int width = min(BK, L - kb * BK);
+    for (int i = tid; i < width * D; i += tgsize) {{
+        const int ss = kb * BK + i / D, d = i % D;
         const long row = ((base + ss) * SL) * QKV_W;
-        dqkv[row + K_OFF + j * D + d] = bfloat(Ks[i] * k_scale);
-        const float dvv = Vs[i];
+        dqkv[row + K_OFF + j * D + d] = bfloat(dKs[i] * scale);
+        const float dvv = dVs[i];
         dqkv[row + V_OFF + j * D + d] = bfloat(dvv);
         if (ve_off >= 0) {{
             dvemb[((base + ss) * SL) * dve_stride + ve_off + j * D + d] = dvv;
@@ -517,7 +604,8 @@ kernel void attn_bwd(
 // back. No thread reads a slot another thread of this dispatch writes.
 // qkv [B*T, QKV_W] bf16; vemb [B*T, ve_stride] fp32 at ve_off (< 0: none);
 // kc/vc [capacity, KVH, max_len, D] half (one layer); positions [B] int64;
-// out [B*T, NH*D] bf16.
+// out [B*T, NH*D] bf16; with ``gathered``, row b reads and writes cache row
+// rows[b] instead of b.
 kernel void attn_decode(
     device const bfloat* qkv [[buffer(0)]],
     device const float* vemb [[buffer(1)]],
@@ -531,6 +619,8 @@ kernel void attn_decode(
     constant int& ve_stride [[buffer(9)]],
     constant int& ve_off [[buffer(10)]],
     constant float& scale_log2 [[buffer(11)]],
+    device const long* rows [[buffer(12)]],
+    constant int& gathered [[buffer(13)]],
     uint gid [[thread_position_in_grid]])
 {{
     const int t = gid % T;
@@ -539,7 +629,8 @@ kernel void attn_decode(
     const int b = gid / (T * G * KVH);
     if (b >= B) return;
     const int pos0 = (int)positions[b];
-    const long cache_row = ((long)b * KVH + j) * max_len;
+    const long row_b = gathered ? rows[b] : (long)b;
+    const long cache_row = (row_b * KVH + j) * max_len;
     const long tok0 = (long)b * T;
     if (g == 0) {{
         const long src = (tok0 + t) * QKV_W;
@@ -675,7 +766,7 @@ class MetalTrunk:
 
     max_length = MAX_LENGTH
 
-    def __init__(self, config: TrunkConfig, *, max_length: int, eps: float = 1e-5) -> None:
+    def __init__(self, config: TrunkConfig, *, max_length: int | None = None, eps: float = 1e-5) -> None:
         reason = unsupported_reason(config, max_length)
         if reason is not None:
             raise ValueError(f"Metal trunk unsupported: {reason}.")
@@ -725,9 +816,12 @@ class MetalTrunk:
             self._weight_key = key
         return self._weights
 
-    def _attention_group(self, length: int) -> int:
+    def _attention_shape(self, length: int) -> tuple[int, int]:
+        """(blocks per sequence and KV head, threads per threadgroup)."""
+
         group = self.n_heads // self.kv_heads
-        return ((group * length + 31) // 32) * 32
+        block = _block(group, self.head_dim)
+        return (length + block - 1) // block, ((group * block + 31) // 32) * 32
 
     # -- kernels ---------------------------------------------------------
 
@@ -818,12 +912,12 @@ class MetalTrunk:
         lse = torch.empty(batch, self.n_heads, length, device=qkv.device)
         index = self.value_index.get(layer)
         ve_off = -1 if index is None or values is None else index * self.kv_width
-        group = self._attention_group(length)
+        blocks, group = self._attention_shape(length)
         self.lib.attn_fwd(
             qkv, values if ve_off >= 0 else lse, out, lse, length,
             values.shape[-1] if ve_off >= 0 else 0, ve_off,
             self.scale * math.log2(math.e),
-            threads=batch * self.kv_heads * group, group_size=group,
+            threads=batch * self.kv_heads * blocks * group, group_size=group,
         )
         return out, lse, ve_off
 
@@ -832,14 +926,23 @@ class MetalTrunk:
         dqkv = torch.empty(batch, length, streams, qkv.shape[-1],
                            device=qkv.device, dtype=torch.bfloat16)
         use_values = ve_off >= 0
-        group = self._attention_group(length)
-        self.lib.attn_bwd(
-            qkv, values if use_values else lse, out, lse, dout, dqkv,
+        blocks, group = self._attention_shape(length)
+        threads = streams * batch * self.kv_heads * blocks * group
+        delta = torch.empty(streams, batch, self.n_heads, length, device=qkv.device)
+        scale_log2 = self.scale * math.log2(math.e)
+        self.lib.attn_bwd_dq(
+            qkv, values if use_values else lse, out, lse, dout, dqkv, delta, length,
+            values.shape[-1] if use_values else 0, ve_off,
+            scale_log2, self.scale, batch, streams,
+            threads=threads, group_size=group,
+        )
+        self.lib.attn_bwd_dkv(
+            qkv, values if use_values else lse, lse, dout, delta, dqkv,
             dvalues if use_values else lse, length,
             values.shape[-1] if use_values else 0, ve_off,
             dvalues.shape[-1] if use_values else 0,
-            self.scale * math.log2(math.e), self.scale, batch, streams,
-            threads=streams * batch * self.kv_heads * group, group_size=group,
+            scale_log2, self.scale, batch, streams,
+            threads=threads, group_size=group,
         )
         return dqkv
 
@@ -853,8 +956,6 @@ class MetalTrunk:
         """
 
         batch, length, _ = x0.shape
-        if length > MAX_LENGTH:
-            raise ValueError(f"Metal trunk sequences are limited to {MAX_LENGTH}.")
         rows = batch * length
         x = x0.reshape(rows, self.dm).float().contiguous()
         ple_flat = (
@@ -977,13 +1078,14 @@ class MetalTrunk:
 
     # -- cached decode (rollout) ----------------------------------------
 
-    def decode(self, x0, ple, values, cache, positions, trunk):
+    def decode(self, x0, ple, values, cache, positions, trunk, cache_rows=None):
         """One merged-wave decode step through every layer.
 
         x0 [B, T, DM] embeddings of the appended tokens, ple/values their
         conditioning, ``positions`` [B] each row's write position for token 0.
-        Writes the new K/V into ``cache`` (fp16, dense rows 0..B-1) and returns
-        the final-norm output for every appended token, [B, T, DM] fp32.
+        Writes the new K/V into ``cache`` (fp16; rows 0..B-1, or ``cache_rows``
+        [B] int64) and returns the final-norm output for every appended token,
+        [B, T, DM] fp32.
         """
 
         params = trunk_parameters(trunk)
@@ -999,6 +1101,8 @@ class MetalTrunk:
             else None
         )
         positions = positions.to(torch.int64).contiguous()
+        if cache_rows is not None:
+            cache_rows = cache_rows.to(torch.int64).contiguous()
         cast = self._bf16_weights(params)
         _, a, _ = self._add_ln(rows, params[_LN1_W], params[_LN1_B], x=x)
         for layer in range(self.layers):
@@ -1015,6 +1119,7 @@ class MetalTrunk:
                 positions, o, batch, steps, cache.max_len,
                 ve.shape[-1] if ve_off >= 0 else 0, ve_off,
                 self.scale * math.log2(math.e),
+                positions if cache_rows is None else cache_rows, int(cache_rows is not None),
                 threads=batch * self.kv_heads * group * steps, group_size=256,
             )
             x1, m, _ = self._add_ln(
@@ -1032,7 +1137,6 @@ class MetalTrunk:
     def decode_supported(self, cache) -> bool:
         return (
             cache.dtype == torch.float16
-            and cache.max_len <= MAX_LENGTH + 1
             and all(k.is_contiguous() for k in cache.k)
             and all(v.is_contiguous() for v in cache.v)
         )
@@ -1088,6 +1192,12 @@ class DualTrunkPass:
     def __init__(self, model, tokens: torch.Tensor) -> None:
         self.trunk = model.trunk
         self.x0, self.ple, self.values = model.prepare(tokens)
+        # A policy that reads per-position features of the embedding (the
+        # model's pop_context) gets them as a leaf too, so each loss's
+        # embedding gradient is one replay rather than a head pass plus a replay.
+        context = model.pop_context() if hasattr(model, "pop_context") else None
+        self.embedded_context = context
+        self.context = None if context is None else context.detach().requires_grad_()
         self.params = trunk_parameters(self.trunk)
         with torch.no_grad():
             hidden, self.saved = self.trunk.metal.forward(
@@ -1109,12 +1219,15 @@ class DualTrunkPass:
         results: list[list[torch.Tensor | None] | None] = [None] * len(losses)
         if not active:
             return results
+        leaves = [self.hidden] + ([self.context] if self.context is not None else [])
         head = []
         for position, index in enumerate(active):
             head.append(torch.autograd.grad(
-                losses[index], [self.hidden, *others],
+                losses[index], [*leaves, *others],
                 retain_graph=position + 1 < len(active), allow_unused=True,
             ))
+        dcontext = [g[1] if self.context is not None else None for g in head]
+        head = [(g[0], *g[len(leaves):]) for g in head]
         dh = torch.stack(
             [g[0] if g[0] is not None else torch.zeros_like(self.hidden) for g in head],
             dim=2,
@@ -1134,6 +1247,8 @@ class DualTrunkPass:
             if self.values is not None and dvalues is not None:
                 cotangents.append(dvalues[:, :, position])
             pairs = [(o, c) for o, c, r in zip(outputs, cotangents, reachable) if r]
+            if dcontext[position] is not None and self.embedded_context.requires_grad:
+                pairs.append((self.embedded_context, dcontext[position]))
             embedding = (
                 torch.autograd.grad(
                     [o for o, _ in pairs], others, [c for _, c in pairs],

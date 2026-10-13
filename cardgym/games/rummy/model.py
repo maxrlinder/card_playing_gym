@@ -138,14 +138,21 @@ class GridBlock(nn.Module):
         self.register_buffer("pool", torch.full((1, NUM_SUITS), 1.0 / NUM_SUITS), persistent=False)
         self.register_buffer("spread", torch.ones(NUM_SUITS, 1), persistent=False)
 
-    def circulant(self) -> torch.Tensor:
+    def circulant(self, weight: torch.Tensor | None = None) -> torch.Tensor:
         """The convolution as a [13 * width, 13 * hidden] matrix acting on one suit row."""
 
-        weight = self.along_rank.weight  # [hidden, width, kernel]
+        weight = self.along_rank.weight if weight is None else weight  # [hidden, width, kernel]
         hidden, width, _ = weight.shape
         return torch.einsum("kio,hwk->iwoh", self.shifts.to(weight.dtype), weight).reshape(
             NUM_RANKS * width, NUM_RANKS * hidden
         )
+
+    def conv_grad(self, d_circulant: torch.Tensor) -> torch.Tensor:
+        """The Conv1d weight gradient [hidden, width, kernel] from the circulant's gradient."""
+
+        hidden, width, _ = self.along_rank.weight.shape
+        shaped = d_circulant.reshape(NUM_RANKS, width, NUM_RANKS, hidden)
+        return torch.einsum("kio,iwoh->hwk", self.shifts.to(shaped.dtype), shaped)
 
     def forward(self, grid: torch.Tensor) -> torch.Tensor:  # [N, suits, ranks, width]
         count, _, _, width = grid.shape
@@ -173,6 +180,11 @@ class CardGrid(nn.Module):
         )
         self.norm = FusedRMSNorm(width)
         self.summary = nn.Linear(NUM_CARDS * width, config.d_model, bias=False)
+        self.hidden = config.ledger_hidden
+        self.eps = self.norm.eps
+        # Fused Metal kernels (metal_grid) under MPS bf16 autocast; set by
+        # enable_metal_trunk, like the trunk's.
+        self.fused = False
         for module in (self.code, self.rank, *self.blocks):
             module.apply(init_weights)
         with torch.no_grad():
@@ -182,8 +194,29 @@ class CardGrid(nn.Module):
         nn.init.normal_(self.summary.weight, std=0.02 * (NUM_FIELDS / (NUM_CARDS * width)) ** 0.5)
         self.register_buffer("card_ranks", torch.as_tensor(CARD_RANKS, dtype=torch.long), persistent=False)
 
+    def uses_fused(self, device: torch.device) -> bool:
+        return (
+            self.fused
+            and device.type == "mps"
+            and len(self.blocks) > 0
+            and torch.is_autocast_enabled("mps")
+            and torch.get_autocast_dtype("mps") == torch.bfloat16
+        )
+
     def cards(self, ledger: torch.Tensor) -> torch.Tensor:
         lead = ledger.shape[:-1]
+        if self.uses_fused(ledger.device):
+            from .metal_grid import FusedCardGrid
+
+            params = [self.code.weight, self.rank.weight]
+            for block in self.blocks:
+                params += [
+                    block.norm.weight, block.along_rank.weight, block.along_rank.bias,
+                    block.across_suits.weight, block.out.weight, block.out.bias,
+                ]
+            params.append(self.norm.weight)
+            flat = ledger.reshape(-1, NUM_CARDS).long().contiguous()
+            return FusedCardGrid.apply(self, flat, *params).reshape(*lead, NUM_CARDS, self.width)
         grid = self.code(ledger.long()) + self.rank(self.card_ranks)
         grid = grid.reshape(-1, NUM_SUITS, NUM_RANKS, self.width)
         for block in self.blocks:
@@ -307,6 +340,10 @@ class RummyActor(PolicyModel):
     def embed(self, tokens: torch.Tensor):
         return self.embedding(tokens)
 
+    def enable_metal_trunk(self, max_length: int | None = None) -> None:
+        super().enable_metal_trunk(max_length)
+        self.embedding.grid.fused = metal_grid_supported(self.config)
+
     def pop_context(self) -> torch.Tensor | None:
         cards, self.embedding.kept = self.embedding.kept, None
         return cards
@@ -321,6 +358,12 @@ class RummyActor(PolicyModel):
 
     def player_values(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.value_head(hidden)
+
+
+def metal_grid_supported(config: RummyModelConfig) -> bool:
+    from .metal_grid import supported
+
+    return config.ledger_layers > 0 and supported(config.ledger_width, config.ledger_hidden)
 
 
 class RummyCritic(CriticModel):
@@ -338,6 +381,10 @@ class RummyCritic(CriticModel):
 
     def embed(self, tokens: torch.Tensor):
         return self.embedding(tokens)
+
+    def enable_metal_trunk(self, max_length: int | None = None) -> None:
+        super().enable_metal_trunk(max_length)
+        self.embedding.grid.fused = metal_grid_supported(self.config)
 
     def player_values(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.value_head(hidden)

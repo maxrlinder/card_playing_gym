@@ -367,10 +367,10 @@ class PPOTrainer:
                 with autocast_context(self.device, self.precision):
                     if budget and self.actor.trunk.uses_metal(self.device, tokens.shape[1]):
                         dual = DualTrunkPass(self.actor, tokens)
-                        hidden = dual.hidden
+                        hidden, context = dual.hidden, dual.context
                     else:
                         hidden = self.actor.forward_hidden(tokens)
-                context = self.actor.pop_context()
+                        context = self.actor.pop_context()
                 dense = self._dense_rows(group, start, stop)
                 auxiliary = torch.zeros((), device=self.device)
                 hooked = self.hooks.actor_auxiliary(self.actor, hidden, dense, group, totals)

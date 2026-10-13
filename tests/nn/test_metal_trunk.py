@@ -152,14 +152,14 @@ def test_trunk_only_replaces_bf16_autocast_on_mps():
     with torch.autocast("mps", dtype=torch.bfloat16):
         assert trunk.uses_metal(DEVICE, 81)
         assert not trunk.uses_metal(torch.device("cpu"), 81)
-        assert not trunk.uses_metal(DEVICE, 129)
+        assert trunk.uses_metal(DEVICE, 500)  # attention tiles keys: no length limit
 
 
 def test_unsupported_configurations_are_named():
     assert unsupported_reason(config().trunk(), MAX_LENGTH) is None
     assert unsupported_reason(config(per_layer_dim=32).trunk(), MAX_LENGTH) is not None
-    assert unsupported_reason(config(n_heads=4, n_kv_heads=2).trunk(), MAX_LENGTH) is not None
-    assert unsupported_reason(config().trunk(), 200) is not None
+    assert unsupported_reason(config(n_heads=2, n_kv_heads=2).trunk(), MAX_LENGTH) is not None  # head_dim 120
+    assert unsupported_reason(config().trunk(), 500) is None
 
 
 def test_merged_decode_matches_the_pytorch_cached_decode():

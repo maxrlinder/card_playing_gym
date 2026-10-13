@@ -91,7 +91,7 @@ class SequenceModel(nn.Module):
             dtype=dtype,
         )
 
-    def enable_metal_trunk(self, max_length: int) -> None:
+    def enable_metal_trunk(self, max_length: int | None = None) -> None:
         """Route bf16 MPS trunk forwards (and backwards) through fused Metal kernels."""
 
         from .metal_trunk import MetalTrunk

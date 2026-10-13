@@ -382,8 +382,8 @@ class Trunk(nn.Module):
 
         length = x.shape[1]
         batch = torch.arange(x.shape[0], device=x.device)
-        if rows is None and self.uses_metal(x.device, length) and self.metal.decode_supported(cache):
-            normed = self.metal.decode(x, ple, values, cache, positions, self)
+        if self.uses_metal(x.device, length) and self.metal.decode_supported(cache):
+            normed = self.metal.decode(x, ple, values, cache, positions, self, rows)
             return normed[batch, readout_offsets]
         steps = torch.arange(length, device=positions.device)[None, :]
         write_positions = (positions[:, None] + steps).clamp(max=cache.max_len - 1)
