@@ -1,0 +1,60 @@
+# First Rummy recipe: the architecture of docs/rummy.md at a starting size.
+# Model width, depth, entropy floors, and batch size are untuned.
+#   CARDGYM_RUNS_DIR=... cardgym rummy train r1 --config configs/rummy/base.toml
+
+[run]
+game = "rummy"
+iterations = 20000
+checkpoint_every = 100
+dashboard_every = 50
+device = "auto"
+precision = "bf16"
+seed = 0
+
+[rollout]
+kv_dtype = "fp16"
+max_rows = 4096
+
+[model]
+d_model = 256
+n_layers = 8
+n_heads = 8
+n_kv_heads = 2
+d_ff = 768
+per_layer_dim = 32
+value_embeddings = "alternating"
+ledger_width = 32
+ledger_hidden = 64
+ledger_layers = 2
+ledger_kernel = 5
+score_dim = 64
+
+[ppo]
+learning_rate = 3e-4
+lr_warmup_updates = 50
+clip_ratio = 0.2
+max_grad_norm = 1.0
+advantage_estimator = "monte_carlo"
+critic_learning_rate = 3e-4
+critic_epochs = 2
+# Returns are relative points; a typical round moves tens of them.
+value_reward_scale = 50.0
+actor_value_coef = 0.2
+auxiliary_grad_fraction = 0.25
+entropy_mode = "adaptive"
+entropy_targets = { draw = 0.15, play = 0.15 }
+microbatch_positions = 8192
+sequence_bucket_width = 32
+critic_sequence_bucket_width = 32
+
+[game]
+player_counts = [2, 3, 4]
+hand_sizes = [13]
+games_per_shape = 96
+opening_points = 30
+max_turns = 200
+
+[losses]
+hands = 0.2
+winner = 0.1
+penalty = 0.1

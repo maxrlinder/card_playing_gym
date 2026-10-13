@@ -1,0 +1,46 @@
+# A seconds-long CPU run that exercises every part of the pipeline:
+#   cardgym rummy train smoke --config configs/rummy/smoke.toml
+
+[run]
+game = "rummy"
+iterations = 3
+checkpoint_every = 1
+device = "cpu"
+precision = "fp32"
+seed = 0
+
+[rollout]
+kv_dtype = "fp32"
+max_rows = 1024
+
+[model]
+d_model = 32
+n_layers = 2
+n_heads = 4
+n_kv_heads = 2
+d_ff = 64
+per_layer_dim = 8
+value_embeddings = "alternating"
+ledger_width = 8
+ledger_hidden = 16
+ledger_layers = 1
+score_dim = 16
+
+[ppo]
+learning_rate = 0.001
+lr_warmup_updates = 1
+clip_ratio = 0.2
+critic_epochs = 2
+value_reward_scale = 50.0
+actor_value_coef = 0.2
+auxiliary_grad_fraction = 0.25
+entropy_targets = { draw = 0.5, play = 0.5 }
+microbatch_positions = 4096
+
+[game]
+player_counts = [2, 4]
+hand_sizes = [7]
+games_per_shape = 2
+max_turns = 40
+
+[losses]

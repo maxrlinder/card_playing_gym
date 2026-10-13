@@ -31,7 +31,15 @@ class PolicyModel(SequenceModel):
         hidden: torch.Tensor,
         head: str,
         features: dict[str, torch.Tensor] | None = None,
+        tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Logits [N, actions] from readout hidden states [N, d].
+
+        ``features`` are the decisions' padded candidate arrays (pointer
+        heads); ``tokens`` [N, W] are the readout tokens themselves, so a head
+        can read raw fields (such as a card ledger) at the decision point.
+        """
+
         raise NotImplementedError
 
     def player_values(self, hidden: torch.Tensor) -> torch.Tensor:

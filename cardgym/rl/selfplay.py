@@ -127,6 +127,7 @@ class _Live:
     blocks: list[list[np.ndarray]]  # per observer recorded blocks
     decisions: list[DecisionRecord] = field(default_factory=list)
     pending: Decision | None = None
+    readout: np.ndarray | None = None  # the pending actor's last token
     logits: np.ndarray | None = None
 
 
@@ -288,6 +289,8 @@ class SelfPlayCollector:
                 for position, (state, seat, _) in enumerate(entries)
                 if state.pending.seat == seat
             ]
+            for position, state in readout:
+                state.readout = entries[position][2][-1]
             with autocast_context(self.device, self.precision):
                 hidden = self.model.forward_prefill(tokens, cache, rows)
             self.stats.forward_rows += len(entries) * length
@@ -322,6 +325,7 @@ class SelfPlayCollector:
             state.pending = state.game.decision()
             if not len(blocks[state.pending.seat]):
                 raise AssertionError("The next actor's stream received no readout token.")
+            state.readout = blocks[state.pending.seat][-1]
             readout_rows.append(state.base + state.pending.seat)
             readout_states.append(state)
         if longest >= self.cache_length:
@@ -356,8 +360,11 @@ class SelfPlayCollector:
                     [states[p].pending.features for p in positions], self.device
                 )
                 index = torch.tensor(positions, dtype=torch.long, device=self.device)
+                tokens = torch.from_numpy(
+                    np.stack([states[p].readout for p in positions]).astype(np.int64)
+                ).to(self.device)
                 launched.append(
-                    (positions, self.model.policy_logits(hidden[index], head, features))
+                    (positions, self.model.policy_logits(hidden[index], head, features, tokens))
                 )
         for positions, logits in launched:
             values = logits.float().cpu().numpy()

@@ -130,6 +130,19 @@ def configure_adam(optimizer: torch.optim.Optimizer, device: torch.device) -> No
             state["step"] = state["step"].to(counter_device)
 
 
+def standardize_grads(parameters: Sequence[torch.Tensor]) -> None:
+    """Give every gradient its parameter's (contiguous) layout.
+
+    Fused Adam requires parameter, gradient, and moments to share a layout,
+    but some MPS backward kernels (Conv1d weights) return permuted strides.
+    """
+
+    for parameter in parameters:
+        grad = parameter.grad
+        if grad is not None and grad.stride() != parameter.stride():
+            parameter.grad = grad.contiguous()
+
+
 class PPOTrainer:
     def __init__(
         self,
@@ -194,6 +207,7 @@ class PPOTrainer:
                 torch.nn.utils.clip_grad_norm_(self.actor_parameters, self.config.max_grad_norm)
             )
             self._set_learning_rate(iteration)
+            standardize_grads(self.actor_parameters)
             self.actor_optimizer.step()
             self.optimizer_steps += 1
             observed = {
@@ -363,13 +377,14 @@ class PPOTrainer:
                     selected = indexes[head].select(group_index, start, stop)
                     if selected.size:
                         policy = policy + self._policy_loss(
-                            hidden, rows, selected, start, head, alpha[head], totals
+                            hidden, tokens, rows, selected, start, head, alpha[head], totals
                         )
                 self._backward(auxiliary, policy, dual)
 
     def _policy_loss(
         self,
         hidden: torch.Tensor,
+        tokens: torch.Tensor,
         rows: DecisionRows,
         selected: np.ndarray,
         start: int,
@@ -385,7 +400,7 @@ class PPOTrainer:
             else {key: torch.from_numpy(value[selected]).to(self.device) for key, value in rows.features.items()}
         )
         with autocast_context(self.device, self.precision):
-            logits = self.actor.policy_logits(hidden[seq, pos], head, features)
+            logits = self.actor.policy_logits(hidden[seq, pos], head, features, tokens[seq, pos])
         old_probs = torch.from_numpy(rows.probs[selected]).to(self.device)
         logits = logits.float()[:, : old_probs.shape[1]]
         terms = ppo_terms(
@@ -543,6 +558,7 @@ class PPOTrainer:
             grad_norm = float(
                 torch.nn.utils.clip_grad_norm_(self.critic_parameters, self.config.max_grad_norm)
             )
+            standardize_grads(self.critic_parameters)
             self.critic_optimizer.step()
             epoch_losses.append(math.fsum(float(value) for value in pending))
         reduced = {key: math.fsum(float(v) for v in values) for key, values in totals.items()}
