@@ -13,7 +13,7 @@ SMOKE = str(ROOT / "configs" / "rummy" / "smoke.toml")
 
 
 def test_presets_resolve():
-    for name in ("smoke", "base"):
+    for name in ("smoke", "base", "deep"):
         config = load_config(ROOT / "configs" / "rummy" / f"{name}.toml")
         assert set(normalized_raw(config)) == {"run", "rollout", "ppo", "model", "game", "losses"}
         assert config.run.game == "rummy"
@@ -60,3 +60,32 @@ def test_asynchronous_rollout(runs_dir, tmp_path):
     assert float(history[0]["policy_lag"]) == 0  # primed with the initial weights
     assert all(float(row["policy_lag"]) >= 1 for row in history[1:])
     assert all(float(row["rollout_sec"]) > 0 for row in history)
+
+
+def test_rollout_workers_share_each_lane(runs_dir, tmp_path):
+    """Two rollout processes, each with its share of every lane, deliver one update's games together."""
+
+    config = tmp_path / "workers.toml"
+    config.write_text(
+        (ROOT / "configs" / "rummy" / "smoke.toml").read_text().replace(
+            'mode = "continuous"\n', 'mode = "continuous"\nasynchronous = true\nworkers = 2\n'
+        )
+    )
+    assert main(["rummy", "train", "workers", "--config", str(config), "--iterations", "3"]) == 0
+    with open(runs_dir / "rummy" / "workers" / "metrics.csv", newline="") as handle:
+        history = list(csv.DictReader(handle))
+    assert [int(row["iteration"]) for row in history] == [1, 2, 3]
+    assert all(int(float(row["games"])) == 4 for row in history)  # 2 lanes x 2 games, split 1 + 1
+    assert all(float(row["policy_lag"]) >= 1 for row in history[1:])
+
+
+def test_split_lanes_divides_quota_and_games_in_flight():
+    from cardgym.rl.continuous import split_lanes
+    from cardgym.rl.setup import load_config as load
+
+    lanes = load(SMOKE).game.lanes(1.5)
+    shares = [lane for worker in range(3) for lane in split_lanes(lanes, worker, 3)]
+    for lane in lanes:
+        mine = [share for share in shares if share.name == lane.name]
+        assert sum(share.quota for share in mine) == lane.quota
+        assert all(share.in_flight >= 1 for share in mine)

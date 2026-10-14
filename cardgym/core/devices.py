@@ -8,6 +8,7 @@ from contextlib import contextmanager, nullcontext
 from functools import lru_cache
 from typing import Iterator
 
+import numpy as np
 import torch
 
 PRECISIONS = ("fp32", "fp16", "bf16")
@@ -73,6 +74,28 @@ def to_device(array, device: torch.device) -> torch.Tensor:
     """
 
     return torch.from_numpy(array).to(device, non_blocking=True)
+
+
+class Uploader:
+    """Non-blocking uploads of host arrays, kept alive until :meth:`release`.
+
+    A blocking upload on MPS waits for all queued work, so an update that
+    uploads its labels and decision rows between kernels drains the queue each
+    time and the device idles while Python issues the next kernels. Release
+    only after a synchronization point that follows the last upload.
+    """
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self._keep: list[np.ndarray] = []
+
+    def __call__(self, array) -> torch.Tensor:
+        array = np.ascontiguousarray(array)
+        self._keep.append(array)
+        return to_device(array, self.device)
+
+    def release(self) -> None:
+        self._keep = []
 
 
 def release_device_memory(device: torch.device) -> None:

@@ -1,0 +1,76 @@
+# The base recipe at 12 layers and 3x the games per update (432), grown from a
+# trained 8-layer run rather than started from scratch:
+#   cardgym rummy grow r6 --from r5 --config configs/rummy/deep.toml --fresh 4,5,10,11
+#   CARDGYM_METAL_TRUNK=1 tools/train_supervised.sh rummy r6 configs/rummy/deep.toml
+
+[run]
+game = "rummy"
+iterations = 1000000
+checkpoint_every = 100
+dashboard_every = 50
+device = "auto"
+precision = "bf16"
+seed = 0
+
+[rollout]
+kv_dtype = "fp16"
+# Keep every lane's games in flight and refill as they end: a collection costs
+# about quota * mean length / in_flight waves instead of the longest game.
+mode = "continuous"
+concurrency = 1.0
+# Collect the next batch in separate processes during the update; policy lag
+# is ~2 versions. Collection is host-bound (~50 us of game rules and tokens per
+# decision), so two workers split it; a third adds GPU contention and memory.
+asynchronous = true
+workers = 2
+
+[model]
+d_model = 256
+n_layers = 12
+n_heads = 8
+n_kv_heads = 2
+d_ff = 768
+per_layer_dim = 64
+value_embeddings = "alternating"
+ledger_width = 32
+ledger_hidden = 64
+ledger_layers = 2
+ledger_kernel = 5
+score_dim = 64
+
+[ppo]
+learning_rate = 3e-4
+lr_warmup_updates = 10
+clip_ratio = 0.2
+# From scratch, optimizer steps per hour are what limit early learning.
+epochs = 2
+max_grad_norm = 1.0
+advantage_estimator = "monte_carlo"
+critic_learning_rate = 3e-4
+critic_epochs = 2
+# Returns are relative points; a typical round moves tens of them.
+value_reward_scale = 50.0
+actor_value_coef = 0.2
+auxiliary_grad_fraction = 0.25
+entropy_mode = "adaptive"
+entropy_targets = { draw = 0.15, play = 0.15 }
+# One token per own decision: streams are tens of tokens, rarely past 128.
+# The fused trunk runs packed rows (real tokens only), so padding costs no
+# compute: wide buckets make one or two groups, and 32k real tokens hold a
+# whole update's ~27k in one microbatch per epoch.
+microbatch_positions = 32768
+sequence_bucket_width = 64
+critic_sequence_bucket_width = 64
+min_group_sequences = 32
+
+[game]
+player_counts = [2, 3, 4]
+hand_sizes = [13]
+games_per_shape = 144
+opening_points = 30
+max_turns = 200
+
+[losses]
+hands = 0.2
+winner = 0.1
+penalty = 0.1

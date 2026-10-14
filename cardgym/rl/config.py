@@ -36,7 +36,8 @@ class RolloutConfig:
     # a larger schedule is cut into several loops.
     max_rows: int = 12288
     # Game groups decoded alternately: the device runs one group's wave while
-    # the host steps another's games (2 overlaps them; 1 is lockstep).
+    # the host steps another's games (2 overlaps them; 1 is lockstep). Both
+    # modes; in continuous mode each rollout worker splits its own games.
     cohorts: int = 1
     # "batch": deal one update's games together and decode until the last one
     # ends. "continuous": keep games in flight, replace each as it ends, and
@@ -48,6 +49,9 @@ class RolloutConfig:
     # continuous: collect the next batch in a separate process while the
     # update runs (one more version of policy lag; see rl/async_rollout.py).
     asynchronous: bool = False
+    # asynchronous: rollout processes, each running its share of every lane.
+    # Collection is host-bound (game rules, tokens), so this divides it.
+    workers: int = 1
 
     def validate(self) -> None:
         if self.max_rows < 1:
@@ -60,6 +64,8 @@ class RolloutConfig:
             raise ValueError("[rollout] concurrency must be positive.")
         if self.asynchronous and self.mode != "continuous":
             raise ValueError("[rollout] asynchronous requires mode = \"continuous\".")
+        if self.workers < 1 or (self.workers > 1 and not self.asynchronous):
+            raise ValueError("[rollout] workers must be 1, or more with asynchronous = true.")
 
 
 @dataclass(frozen=True)

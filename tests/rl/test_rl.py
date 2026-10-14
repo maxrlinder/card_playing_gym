@@ -159,3 +159,23 @@ def test_small_buckets_merge_upward_and_microbatches_balance():
     assert microbatches(Group(5, 10), 1000) == [(0, 5)]
     spans = microbatches(Group(101, 64), 640)
     assert max(b - a for a, b in spans) <= 10 and min(b - a for a, b in spans) >= 9
+
+
+def test_clip_grad_norm_matches_torch():
+    from cardgym.rl.trainer import clip_grad_norm
+
+    generator = torch.Generator().manual_seed(0)
+    for max_norm in (1e-3, 1e6):
+        mine = [torch.randn(5, 7, generator=generator).requires_grad_() for _ in range(3)]
+        theirs = [p.detach().clone().requires_grad_() for p in mine]
+        for a, b in zip(mine, theirs):
+            a.grad = torch.randn(a.shape, generator=generator)
+            b.grad = a.grad.clone()
+        mine[1].grad = None
+        theirs[1].grad = None
+        norm = clip_grad_norm(mine, max_norm)
+        expected = float(torch.nn.utils.clip_grad_norm_(theirs, max_norm))
+        assert norm == pytest.approx(expected, rel=1e-5)
+        for a, b in zip(mine, theirs):
+            if a.grad is not None:
+                torch.testing.assert_close(a.grad, b.grad)

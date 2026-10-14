@@ -16,6 +16,11 @@ decision records the exact probabilities it was sampled from and PPO's ratio
 is taken against those, so the update stays correct; ``policy_lag`` reports
 how many versions old the returned decisions are.
 
+Cohorts. With ``cohorts = 2`` the slots alternate between two groups that
+take turns: while the device decodes one group's wave, the host samples and
+steps the other's games, so a collector's host work and device work overlap
+instead of alternating. Nothing is in flight between collections.
+
 Rows. Each game owns one cache row per seat. A wave decodes only the rows that
 received tokens (in Rummy, just the acting seat's), gathered by index, so the
 forward batch is the number of live games rather than of observers. The row
@@ -29,7 +34,7 @@ import random
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import torch
@@ -64,12 +69,40 @@ class Lane:
     deal: Callable[[random.Random], SelfPlayGame | None] = field(compare=False)
 
 
+def split_lanes(lanes: list[Lane], index: int, count: int) -> list[Lane]:
+    """Worker ``index`` of ``count``'s share of each lane: its part of the quota and of the games in flight.
+
+    Shares differ by at most one game; a lane with nothing for this worker is left out.
+    """
+
+    shares = []
+    for lane in lanes:
+        if lane.quota is None:
+            raise ValueError("Only lanes with a quota can be split between workers.")
+        quota = lane.quota // count + (index < lane.quota % count)
+        in_flight = lane.in_flight // count + (index < lane.in_flight % count)
+        if quota > 0:
+            shares.append(replace(lane, quota=quota, in_flight=max(1, in_flight)))
+    return shares
+
+
 @dataclass
 class _Slot:
     lane: int
     base: int  # first cache row
+    cohort: int = 0
     state: _Live | None = None
     queued: list[tuple[int, np.ndarray]] = field(default_factory=list)  # (seat, block) not yet decoded
+
+
+@dataclass
+class _Wave:
+    """One cohort's decode in flight: its policy reads on their way to the host."""
+
+    launched: list = field(default_factory=list)
+    fence: Fence | None = None
+    # Host arrays that in-flight non-blocking uploads still read from.
+    keep: list[np.ndarray] = field(default_factory=list)
 
 
 class ContinuousCollector:
@@ -84,11 +117,13 @@ class ContinuousCollector:
         precision: str,
         kv_dtype: str,
         max_length: int,
+        cohorts: int = 1,
     ) -> None:
         self.model = model
         self.device = device
         self.precision = precision
         self.kv_dtype = DTYPES[kv_dtype]
+        self.cohorts = max(1, cohorts)
         # One spare position past the longest stream absorbs ragged padding.
         self.cache_length = max_length + 1
         self.stats = CollectionStats()
@@ -97,9 +132,7 @@ class ContinuousCollector:
         self._finished: dict[str, deque[Trajectory]] = {}
         self._cache = None
         self._scratch = 0
-        self._launched: list = []
-        self._fence: Fence | None = None
-        self._keep: list[np.ndarray] = []
+        self._waves = [_Wave() for _ in range(self.cohorts)]
         self._width: int | None = None
 
     def reset(self) -> None:
@@ -109,9 +142,7 @@ class ContinuousCollector:
         self._slots = []
         self._finished = {}
         self._cache = None
-        self._launched = []
-        self._fence = None
-        self._keep = []
+        self._waves = [_Wave() for _ in range(self.cohorts)]
         release_device_memory(self.device)
 
     def release(self) -> None:
@@ -135,10 +166,17 @@ class ContinuousCollector:
         # bf16 copies of the weights until the outermost context exits, and on
         # MPS each cast is a ~0.2 ms dispatch, paid per weight per wave otherwise.
         with autocast_context(self.device, self.precision):
-            while not self._satisfied(lanes) and self.in_flight:
-                self._launch()
-                self._receive()
-                self._act(lanes, rng, version)
+            pending = [False] * self.cohorts
+            while True:
+                for cohort in range(self.cohorts):
+                    if pending[cohort]:
+                        self._receive(cohort)
+                        self._act(cohort, lanes, rng, version)
+                        pending[cohort] = False
+                    if not self._satisfied(lanes) and self.in_flight:
+                        pending[cohort] = self._launch(cohort)
+                if not any(pending):
+                    break
         results: list[Trajectory] = []
         for lane in lanes:
             bank = self._finished[lane.name]
@@ -163,7 +201,7 @@ class ContinuousCollector:
         for index, lane in enumerate(lanes):
             self._finished[lane.name] = deque()
             for _ in range(lane.in_flight):
-                self._slots.append(_Slot(lane=index, base=row))
+                self._slots.append(_Slot(lane=index, base=row, cohort=len(self._slots) % self.cohorts))
                 row += lane.players
         self._scratch = row
         self._cache = self.model.new_cache(row + 1, self.cache_length, self.kv_dtype)
@@ -239,19 +277,22 @@ class ContinuousCollector:
             returns=np.asarray(state.game.returns(), dtype=np.float64),
         )
 
-    def _upload(self, array: np.ndarray) -> torch.Tensor:
-        self._keep.append(array)
+    def _upload(self, array: np.ndarray, cohort: int) -> torch.Tensor:
+        self._waves[cohort].keep.append(array)
         return to_device(array, self.device)
 
-    def _launch(self) -> None:
-        """Decode every queued block; queue the policy read of every pending decision."""
+    def _launch(self, cohort: int) -> bool:
+        """Decode the cohort's queued blocks; queue the policy read of its pending decisions.
+
+        Returns whether anything was launched (the cohort has live games).
+        """
 
         started = time.perf_counter()
         entries: list[tuple[int, int, np.ndarray]] = []  # (row, position, block)
         readouts: list[tuple[int, _Live]] = []
         for slot in self._slots:
             state = slot.state
-            if state is None:
+            if state is None or slot.cohort != cohort:
                 continue
             actor = state.pending.seat
             for seat, block in slot.queued:
@@ -262,6 +303,9 @@ class ContinuousCollector:
             if int(state.lengths.max()) >= self.cache_length:
                 raise RuntimeError("A stream outgrew the model's maximum sequence length.")
             slot.queued = []
+        if not entries:
+            return False
+        upload = lambda array: self._upload(array, cohort)  # noqa: E731
         run = max(len(block) for _, _, block in entries)
         count = len(entries)
         rows = _round_up(count, self.ROW_BUCKET)
@@ -279,46 +323,47 @@ class ContinuousCollector:
         span = _round_up(int(positions.max()) + run, self.SPAN_BUCKET)
         with autocast_context(self.device, self.precision):
             hidden = self.model.forward_ragged(
-                self._upload(tokens),
-                self._upload(positions),
+                upload(tokens),
+                upload(positions),
                 self._cache,
-                self._upload(offsets),
+                upload(offsets),
                 span=span,
-                rows=self._upload(cache_rows),
+                rows=upload(cache_rows),
             )
         context = self.model.pop_context()
-        index = self._upload(np.asarray([entry for entry, _ in readouts], dtype=np.int64))
+        index = upload(np.asarray([entry for entry, _ in readouts], dtype=np.int64))
         if context is not None:
-            context = context[index, self._upload(offsets[[entry for entry, _ in readouts]])]
-        self._launched = launch_policies(
-            self.model, self.device, self.precision, self._upload,
+            context = context[index, upload(offsets[[entry for entry, _ in readouts]])]
+        wave = self._waves[cohort]
+        wave.launched = launch_policies(
+            self.model, self.device, self.precision, upload,
             hidden[index], [state for _, state in readouts], context,
         )
-        self._fence = Fence(self.device)
+        wave.fence = Fence(self.device)
         self.stats.waves += 1
         self.stats.forward_rows += rows * run
         self.stats.padded_rows += rows * run - sum(len(block) for _, _, block in entries)
         self.stats.peak_rows = max(self.stats.peak_rows, count)
         self.stats.forward_sec += time.perf_counter() - started
+        return True
 
-    def _receive(self) -> None:
+    def _receive(self, cohort: int) -> None:
         started = time.perf_counter()
-        if self._fence is not None:
-            self._fence.wait()
+        wave = self._waves[cohort]
+        if wave.fence is not None:
+            wave.fence.wait()
         self.stats.wait_sec += time.perf_counter() - started
-        for states, logits in self._launched:
+        for states, logits in wave.launched:
             values = logits.numpy()
             for row, state in enumerate(states):
                 state.logits = values[row]
-        self._launched = []
-        self._keep = []
-        self._fence = None
+        self._waves[cohort] = _Wave()
 
-    def _act(self, lanes: list[Lane], rng: random.Random, version: int) -> None:
-        """Sample and apply every pending decision; retire and replace finished games."""
+    def _act(self, cohort: int, lanes: list[Lane], rng: random.Random, version: int) -> None:
+        """Sample and apply the cohort's pending decisions; retire and replace finished games."""
 
         t0 = time.perf_counter()
-        live = [slot for slot in self._slots if slot.state is not None]
+        live = [slot for slot in self._slots if slot.state is not None and slot.cohort == cohort]
         self.stats.decisions += sample_decisions([slot.state for slot in live], version)
         t1 = time.perf_counter()
         for slot in live:

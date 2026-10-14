@@ -212,6 +212,48 @@ per update:
 | memory | trainer ~5 GB peak, rollout process ~2 GB |
 | `behavior_kl` (synchronous, iteration 1) | ~1e-6: cached rollout equals replay |
 
+### Deep preset (`configs/rummy/deep.toml`): 12 layers, 432 games
+
+`r6` is `r5` (8 layers, iteration 22,200) grown to 12 layers with fresh
+identity blocks at positions 4, 5, 10, 11 (`cardgym rummy grow`), with three
+times the games per update. Measured on its own batches (trained play: ~21
+tokens per stream, ~27.5k decisions per update), update alone, one process:
+
+| | update |
+| --- | --- |
+| as `r5` ran (fused trunk, padded buckets of 16) | 4.04 s |
+| attention kernels for short streams, packed rows | 3.04 s |
+| non-blocking uploads | 2.41 s |
+| one host read per phase for reporting scalars | 2.34 s |
+| allocator cache kept between updates | 2.05 s |
+| heads on packed rows; buckets of 64, one microbatch per epoch | 1.89 s |
+| fused field lookups | 1.71 s |
+| card-grid backward as GEMMs, bias gradients as ones columns | 1.63 s |
+| candidate lists scored in width buckets (8, 16, rest) | 1.61 s |
+| gradient norms as squares and sums | **1.49 s** |
+
+The last five rows ran with a cache ceiling the one-microbatch update
+exceeds, so the cache was released every update; at the preset's ceiling (0.6
+of the recommended working set) it is released every other update, 1.50 s on
+average (1.33 s never releasing, but the cache then grows past 15 GB).
+
+End to end (asynchronous rollout, two workers sharing the GPU with the
+update): **~2.0-2.1 s per iteration** (update ~1.7 s under contention, rollout
+~1.8 s), the same wall time `r5` took for a third of the games at 8 layers.
+Memory: trainer ~9.5 GB driver-allocated (12.9 GB peak), each rollout worker
+~1.6 GB. A third worker was no faster (more contention) and left too little
+memory free alongside other applications; `cohorts = 2` inside each worker
+was slower (twice the waves, and each worker's host is already busy).
+
+The fused path agrees with the PyTorch path on everything but the policy
+gradient to 1e-4..1e-3. The policy gradient, a sum of advantage-weighted
+terms that mostly cancel, differs by 4% with clipping off and 16% with it on,
+where the two paths' bf16 roundings also move decisions across the clip
+boundary.
+The fused path is the one closer to the rollout (`behavior_kl` 0.0027 against
+0.0060 for PyTorch on the same batch), and packing and width buckets are exact
+(1e-5 against the padded, unbucketed fused path).
+
 One unexplained glitch: a single iteration of one benchmark reported a
 normalized draw entropy of 1.076 (at most 1 by construction), with every
 gradient norm and loss matching an identical rerun. It did not reproduce; it
@@ -228,10 +270,10 @@ rollout). The first run on the earlier design (`r3`) reached -23 points per
 seat against the heuristic after 200 iterations. Everything about the recipe
 is a starting point:
 
-* **Schedule.** 144 games and two PPO epochs per update. With the rollout
-  hidden, iteration time is the update's; larger batches cost linearly.
-* **Size.** d_model 256, 8 layers, head_dim 32 (GQA 8/2), card grid 2 x 32
-  wide.
+* **Schedule.** 432 games and two PPO epochs per update (`deep.toml`). The
+  update and the rollout now cost about the same.
+* **Size.** d_model 256, 12 layers (8 trained + 4 grown), head_dim 32 (GQA
+  8/2), card grid 2 x 32 wide.
 * **Advantages.** Monte Carlo; GAE is the first variance lever.
 * **Lag.** Decoupled PPO if `policy_lag` starts to cost (see Training).
 * **Beliefs.** `hands` is linear in the readout; a card-conditioned readout
@@ -239,6 +281,8 @@ is a starting point:
 * **Symmetry.** Suit permutation is an exact symmetry of the rules; the grid
   respects it, the per-card summary and event-card rows do not. Random suit
   relabelling per game is free augmentation.
-* **Speed.** The fused grid and attention kernels use scalar FMAs (~1
-  TFLOPS); simdgroup-matrix versions and fused policy heads are the next
-  kernel work, and the host engine (~30 us per decision) bounds the rollout.
+* **Speed.** The policy and auxiliary heads are a sixth of the update (the
+  candidate scorer's ~30 small ops per call); a fused scorer kernel is the
+  next kernel work, then the card grid's forward tail (scalar FMAs). The
+  rollout is host-bound (~50 us of rules, tokens and candidates per decision,
+  plus ~8 ms of dispatch per wave) and shares the GPU with the update.

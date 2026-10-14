@@ -19,6 +19,11 @@ and returns them with slim trajectories. Weights travel through shared-memory
 CPU tensors: the trainer writes them, then sends the request; the rollout
 process loads them before collecting, and the trainer writes again only after
 it has received that batch.
+
+Collection is host work (rules, tokens, candidates; ~50 us per decision for
+Rummy), so ``[rollout] workers`` runs several such processes, each with its
+share of every lane (``split_lanes``) and its own seed, all reading the same
+shared weights. Their batches are concatenated in worker order.
 """
 
 from __future__ import annotations
@@ -50,12 +55,14 @@ class RolloutBatch:
     stats: CollectionStats
 
 
-def _serve(raw_config: dict[str, Any], seed: int, metal: bool, shared: dict, requests, results) -> None:
+def _serve(
+    raw_config: dict[str, Any], seed: int, metal: bool, shared: dict, requests, results, worker: int, workers: int
+) -> None:
     try:
         from cardgym.core.devices import resolve_device
         from cardgym.nn.metal_trunk import unsupported_reason
 
-        from .continuous import ContinuousCollector
+        from .continuous import ContinuousCollector, split_lanes
         from .setup import resolve_config
 
         config = resolve_config(raw_config)
@@ -76,9 +83,10 @@ def _serve(raw_config: dict[str, Any], seed: int, metal: bool, shared: dict, req
             precision=config.run.precision,
             kv_dtype=config.rollout.kv_dtype,
             max_length=game.max_length,
+            cohorts=config.rollout.cohorts,
         )
         rng = random.Random(seed)
-        lanes = game.lanes(config.rollout.concurrency)
+        lanes = split_lanes(game.lanes(config.rollout.concurrency), worker, workers)
         while True:
             version = requests.get()
             if version is None:
@@ -101,53 +109,103 @@ def _serve(raw_config: dict[str, Any], seed: int, metal: bool, shared: dict, req
         results.put(("error", traceback.format_exc()))
 
 
-class RolloutProcess:
-    """A rollout process serving one request at a time."""
+def merge_summaries(summaries: list[dict[str, float]], games: list[int]) -> dict[str, float]:
+    """Game-weighted means of the workers' rollout summaries; ``longest*`` keys take the maximum."""
 
-    def __init__(self, raw_config: dict[str, Any], actor: torch.nn.Module, *, seed: int, metal: bool) -> None:
+    total = max(sum(games), 1)
+    merged: dict[str, float] = {}
+    for key in summaries[0]:
+        values = [summary[key] for summary in summaries]
+        if key.startswith("longest"):
+            merged[key] = max(values)
+        else:
+            merged[key] = sum(value * count for value, count in zip(values, games)) / total
+    return merged
+
+
+def merge_stats(stats: list[CollectionStats]) -> CollectionStats:
+    """Counts and host times add up; the collection took as long as its slowest worker."""
+
+    merged = CollectionStats()
+    for name in ("games", "decisions", "waves", "forward_rows", "padded_rows", "compactions",
+                 "forward_sec", "wait_sec", "sample_sec", "step_sec", "in_flight"):
+        setattr(merged, name, sum(getattr(entry, name) for entry in stats))
+    merged.peak_rows = max(entry.peak_rows for entry in stats)
+    merged.collect_sec = max(entry.collect_sec for entry in stats)
+    decisions = max(merged.decisions, 1)
+    merged.policy_lag = sum(entry.policy_lag * entry.decisions for entry in stats) / decisions
+    return merged
+
+
+class RolloutProcess:
+    """Rollout worker processes serving one request at a time."""
+
+    def __init__(
+        self, raw_config: dict[str, Any], actor: torch.nn.Module, *, seed: int, metal: bool, workers: int = 1
+    ) -> None:
         context = torch.multiprocessing.get_context("spawn")
         self.shared = {
             name: value.detach().to("cpu").clone().share_memory_() for name, value in actor.state_dict().items()
         }
-        self.requests = context.Queue()
-        self.results = context.Queue()
-        self.process = context.Process(
-            target=_serve,
-            args=(raw_config, seed, metal, self.shared, self.requests, self.results),
-            daemon=True,
-            name="cardgym-rollout",
-        )
-        self.process.start()
+        self.requests = [context.Queue() for _ in range(workers)]
+        self.results = [context.Queue() for _ in range(workers)]
+        self.processes = [
+            context.Process(
+                target=_serve,
+                args=(raw_config, seed + 7_919 * worker, metal, self.shared, self.requests[worker],
+                      self.results[worker], worker, workers),
+                daemon=True,
+                name=f"cardgym-rollout-{worker}",
+            )
+            for worker in range(workers)
+        ]
+        for process in self.processes:
+            process.start()
         self.pending = False
 
     def request(self, actor: torch.nn.Module, version: int) -> None:
         """Collect a batch with ``actor``'s current weights, tagged ``version``."""
 
         if self.pending:
-            raise RuntimeError("The rollout process is already collecting.")
+            raise RuntimeError("The rollout processes are already collecting.")
         with torch.no_grad():
             for name, value in actor.state_dict().items():
                 self.shared[name].copy_(value)
-        self.requests.put(version)
+        for requests in self.requests:
+            requests.put(version)
         self.pending = True
 
     def receive(self) -> RolloutBatch:
+        batches = [self._receive(worker) for worker in range(len(self.processes))]
+        self.pending = False
+        if len(batches) == 1:
+            return batches[0]
+        return RolloutBatch(
+            trajectories=[t for batch in batches for t in batch.trajectories],
+            sequences=[s for batch in batches for s in batch.sequences],
+            summary=merge_summaries([b.summary for b in batches], [len(b.trajectories) for b in batches]),
+            stats=merge_stats([b.stats for b in batches]),
+        )
+
+    def _receive(self, worker: int) -> RolloutBatch:
         while True:
             try:
-                status, payload = self.results.get(timeout=5.0)
+                status, payload = self.results[worker].get(timeout=5.0)
                 break
             except queue.Empty:
-                if not self.process.is_alive():
-                    raise RuntimeError(f"The rollout process died (exit code {self.process.exitcode}).")
-        self.pending = False
+                process = self.processes[worker]
+                if not process.is_alive():
+                    raise RuntimeError(f"Rollout process {worker} died (exit code {process.exitcode}).")
         if status == "error":
-            raise RuntimeError(f"The rollout process failed:\n{payload}")
+            raise RuntimeError(f"Rollout process {worker} failed:\n{payload}")
         return payload
 
     def stop(self) -> None:
-        if self.process.is_alive():
-            self.requests.put(None)
-            self.process.join(timeout=30)
-        if self.process.is_alive():
-            self.process.terminate()
-            self.process.join(timeout=5)
+        for process, requests in zip(self.processes, self.requests):
+            if process.is_alive():
+                requests.put(None)
+        for process in self.processes:
+            process.join(timeout=30)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)

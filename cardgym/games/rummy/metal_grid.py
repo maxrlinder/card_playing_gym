@@ -8,9 +8,9 @@ takes 2 ms). Here the GEMMs stay on MPS and everything between them is fused:
 
     forward    embed + norm | circulant GEMM | pool, across, GELU, project,
                residual, next norm | circulant GEMM | ... | final norm
-    backward   final-norm bwd | per block: tail bwd (projection, GELU,
-               across; weight partials per threadgroup) | GEMM data and
-               weight grads | norm bwd (+ pooled grad, + residual)
+    backward   final-norm bwd | per block: GELU recompute, output and across
+               projection GEMMs around a GELU-backward kernel | circulant
+               GEMM data and weight grads | norm bwd (+ pooled grad, + residual)
 
 Precision follows the autocast path where it rounds: the residual stream and
 norm statistics are fp32, GEMM operands bf16. The fused tail keeps GELU and
@@ -27,7 +27,6 @@ import torch
 import torch.nn.functional as F
 
 _TAIL_THREADS = 256
-_BWD_THREADGROUPS = 512
 _NORM_THREADGROUPS = 256
 _NORM_SIMDGROUPS = 8
 
@@ -43,7 +42,6 @@ constant constexpr int C = 52;
 constant constexpr int R = 13;
 constant constexpr int S = 4;
 constant constexpr int TT = {_TAIL_THREADS};
-constant constexpr int WO_PER = (W * H + TT - 1) / TT;
 
 inline float erf_approx(float x) {{
     const float t = 1.0f / (1.0f + 0.3275911f * fabs(x));
@@ -88,6 +86,10 @@ kernel void grid_embed(
 // Block tail, one threadgroup per position: pool y over suits, project
 // across, GELU(along + across), project back, add the residual, and normalize
 // for the next stage (bf16 for the next GEMM, or fp32 cards when final).
+// With save, pooled and across [N, 13, H] also go out in bf16 for the
+// backward's GEMMs; pooled rows carry W + 4 columns, the last four 1, 0, 0, 0,
+// so the across projection's weight-gradient GEMM also yields the
+// convolution bias gradient (its sum over rows).
 kernel void grid_tail(
     device const bfloat* along [[buffer(0)]],
     device const bfloat* y [[buffer(1)]],
@@ -103,6 +105,9 @@ kernel void grid_tail(
     constant int& N [[buffer(11)]],
     constant int& final_out [[buffer(12)]],
     constant float& eps [[buffer(13)]],
+    device bfloat* pooled_out [[buffer(14)]],
+    device bfloat* across_out [[buffer(15)]],
+    constant int& save [[buffer(16)]],
     uint tg [[threadgroup_position_in_grid]],
     uint ntg [[threadgroups_per_grid]],
     uint tid [[thread_position_in_threadgroup]],
@@ -122,6 +127,7 @@ kernel void grid_tail(
             float sum = 0.0f;
             for (int s = 0; s < S; ++s) sum += float(y[(cbase + s * R + r) * W + f]);
             pooled[i] = sum * (1.0f / S);
+            if (save) pooled_out[((long)n * R + r) * (W + 4) + f] = bfloat(pooled[i]);
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int i = tid; i < R * H; i += TT) {{
@@ -129,6 +135,12 @@ kernel void grid_tail(
             float acc = 0.0f;
             for (int f = 0; f < W; ++f) acc = fma(wa[o * W + f], pooled[r * W + f], acc);
             across[i] = acc;
+            if (save) across_out[(long)n * R * H + i] = bfloat(acc);
+        }}
+        if (save) {{
+            for (int i = tid; i < R * 4; i += TT) {{
+                pooled_out[((long)n * R + i / 4) * (W + 4) + W + i % 4] = bfloat(i % 4 == 0 ? 1.0f : 0.0f);
+            }}
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int i = tid; i < C * H; i += TT) {{
@@ -150,131 +162,63 @@ kernel void grid_tail(
     }}
 }}
 
-// Block tail backward. dxo [N, 52, W] fp32 is the gradient at the block's
-// output (residual stream). Writes d_along [N, 52, H] bf16 (the GEMM's output
-// gradient) and d_pooled [N, 13, W] fp32, and per-threadgroup partials of
-// dWo [W, H], dbo [W], dWa [H, W] and the convolution bias gradient [H].
-kernel void grid_tail_bwd(
-    device const float* dxo [[buffer(0)]],
-    device const bfloat* along [[buffer(1)]],
-    device const bfloat* y [[buffer(2)]],
-    device const float* wa [[buffer(3)]],
-    device const float* wo [[buffer(4)]],
-    device bfloat* d_along [[buffer(5)]],
-    device float* d_pooled [[buffer(6)]],
-    device float* partial [[buffer(7)]],
-    constant int& N [[buffer(8)]],
-    uint tg [[threadgroup_position_in_grid]],
-    uint ntg [[threadgroups_per_grid]],
-    uint tid [[thread_position_in_threadgroup]])
+// The block's activation act = GELU(along + across) in bf16, recomputed in
+// the backward for the output projection's weight gradient. Rows carry H + 4
+// columns, the last four 1, 0, 0, 0: the same GEMM then also yields the
+// output bias gradient (the column sums of its output gradient).
+kernel void grid_act(
+    device const bfloat* along [[buffer(0)]],
+    device const bfloat* across [[buffer(1)]],
+    device bfloat* act [[buffer(2)]],
+    constant int& cards [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
 {{
-    threadgroup float dx_s[C * W];
-    threadgroup bfloat act[C * H];
-    threadgroup float wot[H * W];
-    threadgroup float pooled[R * W];
-    threadgroup float across[R * H];  // across, then its gradient
-    for (int i = tid; i < W * H; i += TT) {{ const int j = i / H, o = i % H; wot[o * W + j] = wo[i]; }}
-    float dwo[WO_PER], dwa[WO_PER];
-    for (int k = 0; k < WO_PER; ++k) {{ dwo[k] = 0.0f; dwa[k] = 0.0f; }}
-    float dbo = 0.0f, dbias = 0.0f;
-    for (int n = tg; n < N; n += ntg) {{
-        const long cbase = (long)n * C;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int i = tid; i < C * W; i += TT) dx_s[i] = dxo[cbase * W + i];
-        for (int i = tid; i < R * W; i += TT) {{
-            const int r = i / W, f = i % W;
-            float sum = 0.0f;
-            for (int s = 0; s < S; ++s) sum += float(y[(cbase + s * R + r) * W + f]);
-            pooled[i] = sum * (1.0f / S);
-        }}
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int i = tid; i < R * H; i += TT) {{
-            const int r = i / H, o = i % H;
-            float acc = 0.0f;
-            for (int f = 0; f < W; ++f) acc = fma(wa[o * W + f], pooled[r * W + f], acc);
-            across[i] = acc;
-        }}
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int i = tid; i < C * H; i += TT) {{
-            const int c = i / H, o = i % H;
-            act[i] = bfloat(gelu(float(along[(cbase + c) * H + o]) + across[(c % R) * H + o]));
-        }}
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        // Output projection: weight and bias partials.
-        for (int k = 0; k < WO_PER; ++k) {{
-            const int e = tid + k * TT;
-            if (e < W * H) {{
-                const int j = e / H, o = e % H;
-                float acc = 0.0f;
-                for (int c = 0; c < C; ++c) acc = fma(dx_s[c * W + j], float(act[c * H + o]), acc);
-                dwo[k] += acc;
-            }}
-        }}
-        if (tid < W) {{
-            float acc = 0.0f;
-            for (int c = 0; c < C; ++c) acc += dx_s[c * W + tid];
-            dbo += acc;
-        }}
-        // GELU input gradient per (rank, channel), summed over suits into the
-        // across gradient; each (r, o) belongs to one thread.
-        float dacc[(R * H + TT - 1) / TT];
-        for (int k = 0; k * TT + (int)tid < R * H; ++k) {{
-            const int i = tid + k * TT;
-            const int r = i / H, o = i % H;
-            const float ac = across[i];
-            float sum = 0.0f;
-            for (int s = 0; s < S; ++s) {{
-                const int c = s * R + r;
-                float da = 0.0f;
-                for (int j = 0; j < W; ++j) da = fma(wot[o * W + j], dx_s[c * W + j], da);
-                const float dh = da * gelu_grad(float(along[(cbase + c) * H + o]) + ac);
-                d_along[(cbase + c) * H + o] = bfloat(dh);
-                sum += dh;
-            }}
-            dacc[k] = sum;
-        }}
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int k = 0; k * TT + (int)tid < R * H; ++k) across[tid + k * TT] = dacc[k];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        // Across projection: weight partials, bias (sum of every GELU-input
-        // gradient), and the pooled gradient.
-        for (int k = 0; k < WO_PER; ++k) {{
-            const int e = tid + k * TT;
-            if (e < W * H) {{
-                const int o = e / W, f = e % W;
-                float acc = 0.0f;
-                for (int r = 0; r < R; ++r) acc = fma(across[r * H + o], pooled[r * W + f], acc);
-                dwa[k] += acc;
-            }}
-        }}
-        if (tid < H) {{
-            float acc = 0.0f;
-            for (int r = 0; r < R; ++r) acc += across[r * H + tid];
-            dbias += acc;
-        }}
-        for (int i = tid; i < R * W; i += TT) {{
-            const int r = i / W, f = i % W;
-            float acc = 0.0f;
-            for (int o = 0; o < H; ++o) acc = fma(wa[o * W + f], across[r * H + o], acc);
-            d_pooled[((long)n * R + r) * W + f] = acc;
-        }}
+    const long card = gid / (H + 4);
+    if (card >= cards) return;
+    const int o = gid % (H + 4);
+    if (o >= H) {{ act[gid] = bfloat(o == H ? 1.0f : 0.0f); return; }}
+    const long n = card / C;
+    const int r = (card % C) % R;
+    act[gid] = bfloat(gelu(float(along[card * H + o]) + float(across[(n * R + r) * H + o])));
+}}
+
+// GELU backward on one (position, rank, channel) for all four suits:
+// d_along = d_act * GELU'(along + across) [N * 52, H] bf16 (the circulant
+// GEMM's output gradient), and its sum over suits, d_across [N * 13, H] bf16,
+// the across projection's output gradient.
+kernel void grid_act_bwd(
+    device const bfloat* d_act [[buffer(0)]],
+    device const bfloat* along [[buffer(1)]],
+    device const bfloat* across [[buffer(2)]],
+    device bfloat* d_along [[buffer(3)]],
+    device bfloat* d_across_bf [[buffer(4)]],
+    constant int& N [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{{
+    const long nr = gid / H;
+    if (nr >= (long)N * R) return;
+    const int o = gid % H;
+    const long n = nr / R;
+    const int r = nr % R;
+    const float ac = float(across[gid]);
+    float sum = 0.0f;
+    for (int s = 0; s < S; ++s) {{
+        const long at = (n * C + s * R + r) * H + o;
+        const float dh = float(d_act[at]) * gelu_grad(float(along[at]) + ac);
+        d_along[at] = bfloat(dh);
+        sum += dh;
     }}
-    device float* out = partial + (long)tg * (2 * W * H + W + H);
-    for (int k = 0; k < WO_PER; ++k) {{
-        const int e = tid + k * TT;
-        if (e < W * H) {{ out[e] = dwo[k]; out[W * H + e] = dwa[k]; }}
-    }}
-    if (tid < W) out[2 * W * H + tid] = dbo;
-    if (tid < H) out[2 * W * H + W + tid] = dbias;
+    d_across_bf[gid] = bfloat(sum);
 }}
 
 // RMSNorm backward, one simdgroup per card (lane = feature), grid-stride.
-// dy is bf16 (flags & 1) or fp32; flags & 2 adds d_pooled [N, 13, W] / 4;
-// flags & 4 adds the residual gradient dres. Per-threadgroup gain partials.
+// dy is bf16 (flags & 1) or fp32; flags & 2 adds d_pooled [N, 13, W] / 4
+// (bf16); flags & 4 adds the residual gradient dres; flags & 8 also writes a
+// bf16 copy of dx (the next block's GEMMs read it). Per-threadgroup gain partials.
 kernel void grid_norm_bwd(
     device const bfloat* dy_bf [[buffer(0)]],
     device const float* dy_f [[buffer(1)]],
-    device const float* d_pooled [[buffer(2)]],
+    device const bfloat* d_pooled [[buffer(2)]],
     device const float* x [[buffer(3)]],
     device const float* rstd [[buffer(4)]],
     device const float* gain [[buffer(5)]],
@@ -283,6 +227,7 @@ kernel void grid_norm_bwd(
     device float* partial [[buffer(8)]],
     constant int& cards [[buffer(9)]],
     constant int& flags [[buffer(10)]],
+    device bfloat* dx_bf [[buffer(11)]],
     uint tg [[threadgroup_position_in_grid]],
     uint ntg [[threadgroups_per_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
@@ -297,7 +242,7 @@ kernel void grid_norm_bwd(
         float d = (flags & 1) ? float(dy_bf[at]) : dy_f[at];
         if (flags & 2) {{
             const long n = card / C;
-            d += 0.25f * d_pooled[(n * R + (card % C) % R) * W + lane];
+            d += 0.25f * float(d_pooled[(n * R + (card % C) % R) * W + lane]);
         }}
         const float rs = rstd[card];
         const float xh = x[at] * rs;
@@ -307,6 +252,7 @@ kernel void grid_norm_bwd(
         float v = rs * (gd - xh * m);
         if (flags & 4) v += dres[at];
         dx[at] = v;
+        if (flags & 8) dx_bf[at] = bfloat(v);
     }}
     acc[sg * W + lane] = dg;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -352,11 +298,17 @@ class FusedCardGrid(torch.autograd.Function):
 
     ``params``: code embedding, rank embedding, then per block (norm gain,
     conv weight, conv bias, across weight, out weight, out bias), then the
-    final norm gain. ``grid`` (the CardGrid) builds the circulant matrices.
+    final norm gain. ``grid`` (the CardGrid) builds the circulant matrices and
+    the bf16 projection weights. ``save`` keeps what the backward needs.
+
+    The backward runs each block's small matrix products as GEMMs on MPS
+    (output projection data and weight gradients, the across projection's)
+    between two elementwise kernels; the scalar-FMA fused tail backward this
+    replaces measured 14 ms per block at 20k positions, the GEMM form ~4 ms.
     """
 
     @staticmethod
-    def forward(ctx, grid, ledger, *params):
+    def forward(ctx, grid, ledger, save, *params):
         lib = _library(grid.width, grid.hidden)
         code_w, rank_w = params[0], params[1]
         # Convolution weights and biases enter through grid.blocks[i].gemm_operands.
@@ -385,20 +337,25 @@ class FusedCardGrid(torch.autograd.Function):
             # The final norm's output is the cards in bf16: every consumer is a
             # bf16 GEMM under autocast, which would round them the same way.
             y_out = torch.empty_like(y)
+            pooled = torch.empty(rows * 13, width + 4, device=dev, dtype=torch.bfloat16) if save else y
+            across = torch.empty(rows * 13, hidden, device=dev, dtype=torch.bfloat16) if save else y
             lib.grid_tail(
                 along, y, x, wa, wo, bo, next_gain, x_out, y_out, x, rstd_out, rows, 0, eps,
+                pooled, across, int(save),
                 threads=min(rows, 4096) * _TAIL_THREADS, group_size=_TAIL_THREADS,
             )
-            saved.append((x, y, rstd, along))
-            circulants.append(circulant)
+            if save:
+                saved.append((x, y, rstd, along, pooled, across))
+                circulants.append(circulant)
             x, rstd, y = x_out, rstd_out, y_out
             if last:
                 cards_out = y_out
-        ctx.grid = grid
-        ctx.save_for_backward(ledger, *params)
-        ctx.blocks_saved = saved
-        ctx.circulants = circulants
-        ctx.final = (x, rstd)
+        if save:
+            ctx.grid = grid
+            ctx.save_for_backward(ledger, *params)
+            ctx.blocks_saved = saved
+            ctx.circulants = circulants
+            ctx.final = (x, rstd)
         return cards_out.view(rows, 52, width)
 
     @staticmethod
@@ -415,40 +372,52 @@ class FusedCardGrid(torch.autograd.Function):
         norm_threads = dict(threads=_NORM_THREADGROUPS * _NORM_SIMDGROUPS * 32, group_size=_NORM_SIMDGROUPS * 32)
         x_final, rstd_final = ctx.final
         d_cards = d_cards.reshape(cards, width).float().contiguous()
+        dummy = torch.empty(1, device=dev, dtype=torch.bfloat16)
         dx = torch.empty(cards, width, device=dev)
+        dx_bf = torch.empty(cards, width, device=dev, dtype=torch.bfloat16)
         partial = torch.empty(_NORM_THREADGROUPS, width, device=dev)
         lib.grid_norm_bwd(
-            d_cards, d_cards, d_cards, x_final, rstd_final, params[-1], d_cards, dx, partial, cards, 0,
+            dummy, d_cards, dummy, x_final, rstd_final, params[-1], d_cards, dx, partial, cards, 8, dx_bf,
             **norm_threads,
         )
         grads[-1] = partial.sum(0)
-        stride = 2 * width * hidden + width + hidden
         for index in reversed(range(len(blocks))):
-            gain, _, _, wa, wo, _ = blocks[index]
-            x, y, rstd, along = ctx.blocks_saved[index]
-            d_along = torch.empty(cards, hidden, device=dev, dtype=torch.bfloat16)
-            d_pooled = torch.empty(rows, 13, width, device=dev)
-            groups = min(rows, _BWD_THREADGROUPS)
-            tail = torch.empty(groups, stride, device=dev)
-            lib.grid_tail_bwd(
-                dx, along, y, wa, wo, d_along, d_pooled, tail, rows,
-                threads=groups * _TAIL_THREADS, group_size=_TAIL_THREADS,
-            )
-            sums = tail.sum(0)
+            gain = blocks[index][0]
+            block = grid.blocks[index]
+            wa_bf, wo_bf = block.projection_operands(torch.bfloat16)
+            x, y, rstd, along, pooled, across = ctx.blocks_saved[index]
             base = 2 + 6 * index
-            grads[base + 4] = sums[: width * hidden].view(width, hidden)
-            grads[base + 3] = sums[width * hidden : 2 * width * hidden].view(hidden, width)
-            grads[base + 5] = sums[2 * width * hidden : 2 * width * hidden + width]
-            grads[base + 2] = sums[2 * width * hidden + width :]
+            # Output projection: out = act @ wo^T + bo (act's extra ones column gives bo's gradient).
+            act = torch.empty(cards, hidden + 4, device=dev, dtype=torch.bfloat16)
+            lib.grid_act(along, across, act, cards, threads=cards * (hidden + 4), group_size=256)
+            d_act = dx_bf @ wo_bf
+            weights = _wgrad(dx_bf, act)
+            grads[base + 4] = weights[:, :hidden].contiguous()
+            grads[base + 5] = weights[:, hidden].contiguous()
+            # GELU, then the across projection: across = pooled @ wa^T.
+            d_along = torch.empty(cards, hidden, device=dev, dtype=torch.bfloat16)
+            d_across_bf = torch.empty(rows * 13, hidden, device=dev, dtype=torch.bfloat16)
+            lib.grid_act_bwd(
+                d_act, along, across, d_along, d_across_bf, rows,
+                threads=rows * 13 * hidden, group_size=256,
+            )
+            # pooled's extra ones column gives the convolution bias gradient
+            # (the bias feeds every card and channel of along).
+            weights = _wgrad(d_across_bf, pooled)
+            grads[base + 3] = weights[:, :width].contiguous()
+            grads[base + 2] = weights[:, width].contiguous()
+            d_pooled = d_across_bf @ wa_bf
             # along = y_rows @ circulant (+ bias): data and weight gradients.
             along_rows = d_along.view(rows * 4, 13 * hidden)
             y_rows = y.view(rows * 4, 13 * width)
             dy = (along_rows @ ctx.circulants[index].t()).contiguous()
-            grads[base + 1] = grid.blocks[index].conv_grad(_wgrad(along_rows, y_rows).t())
+            grads[base + 1] = block.conv_grad(_wgrad(along_rows, y_rows).t())
             dx_prev = torch.empty(cards, width, device=dev)
+            dx_bf = torch.empty(cards, width, device=dev, dtype=torch.bfloat16) if index else dummy
             partial = torch.empty(_NORM_THREADGROUPS, width, device=dev)
             lib.grid_norm_bwd(
-                dy, d_cards, d_pooled, x, rstd, gain, dx, dx_prev, partial, cards, 1 | 2 | 4,
+                dy, d_cards, d_pooled, x, rstd, gain, dx, dx_prev, partial, cards,
+                1 | 2 | 4 | (8 if index else 0), dx_bf,
                 **norm_threads,
             )
             grads[base] = partial.sum(0)
@@ -456,4 +425,4 @@ class FusedCardGrid(torch.autograd.Function):
         grads[0] = torch.zeros_like(params[0]).index_add_(0, ledger.reshape(-1), dx)
         ones = torch.ones(1, rows * 4, device=dev)
         grads[1] = (ones @ dx.view(rows * 4, 13 * width)).view(13, width)
-        return (None, None, *grads)
+        return (None, None, None, *grads)

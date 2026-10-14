@@ -7,12 +7,14 @@ import random
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 
 from cardgym.games.rummy.game import RummyGame, RummyGameConfig
 from cardgym.games.rummy.model import RummyModelConfig
 from cardgym.games.rummy.tokens import FIELD_VOCAB, LEDGER_VOCAB
 from cardgym.games.rummy.training import RummyLossConfig
 from cardgym.nn.metal_trunk import DualTrunkPass, MetalTrunk, trunk_parameters, unsupported_reason
+from cardgym.nn.packing import Packing
 from cardgym.rl.continuous import ContinuousCollector
 from cardgym.rl.ppo import masked_probabilities
 from tests.conftest import randomize
@@ -174,3 +176,88 @@ def test_fused_card_grid_matches_pytorch(layers):
     for name, grad in exact_grads.items():
         error = relative(fused_grads[name], grad)
         assert error < max(0.03, 2 * relative(torch_grads[name], grad)), name
+
+
+def test_packed_rows_match_the_padded_batch():
+    """Packed rows (real tokens only, with sequence bounds) give the padded batch's results."""
+
+    game = rummy_game()
+    model = randomize(game.build_critic(), seed=5, scale=0.02).to(DEVICE).train()
+    model.enable_metal_trunk(game.max_length)
+    tokens = random_tokens(48, 70, seed=6)
+    lengths = np.random.default_rng(0).integers(1, 71, size=48)
+    lengths[0] = 70
+    packing = Packing(lengths, DEVICE)
+    real = torch.from_numpy(np.arange(70)[None, :] < lengths[:, None]).to(DEVICE)
+    probe = torch.randn(48, 70, 256, device=DEVICE) * real[..., None]
+    params = [p for p in model.parameters() if p.requires_grad]
+    with torch.autocast("mps", dtype=torch.bfloat16):
+        padded = model.forward_hidden(tokens)
+    padded_grads = torch.autograd.grad((padded.float() * probe).sum(), params, allow_unused=True)
+    packed_tokens = torch.from_numpy(packing.pack(tokens.cpu().numpy())).to(DEVICE)
+    with torch.autocast("mps", dtype=torch.bfloat16):
+        packed = model.forward_hidden(packed_tokens, packing.bounds)
+    assert packed.shape == (int(lengths.sum()), 256)
+    packed_grads = torch.autograd.grad((packed.float() * probe[real]).sum(), params, allow_unused=True)
+    assert relative(packed.detach().float(), padded.detach().float()[real]) < 1e-3
+    for want, have in zip(padded_grads, packed_grads):
+        if want is not None:
+            assert relative(have.float(), want.float()) < 1e-2
+
+
+def test_dual_pass_on_packed_rows():
+    game = rummy_game()
+    model = randomize(game.build_actor(), seed=7, scale=0.02).to(DEVICE).train()
+    model.enable_metal_trunk(game.max_length)
+    tokens = random_tokens(40, 60, seed=8)
+    lengths = np.random.default_rng(1).integers(1, 61, size=40)
+    packing = Packing(lengths, DEVICE)
+    real = np.arange(60)[None, :] < lengths[:, None]
+    params = [p for p in model.parameters() if p.requires_grad]
+    rows = int(real.sum())
+    kind = torch.randint(0, 7, (rows, 6), device=DEVICE)
+    cards = torch.randint(0, 53, (rows, 6, 13), device=DEVICE)
+    target = torch.randint(0, 53, (rows, 6, 13), device=DEVICE)
+    flat_real = torch.from_numpy(np.flatnonzero(real)).to(DEVICE)
+
+    def losses(hidden, context, select):
+        flat = hidden.reshape(-1, hidden.shape[-1])[select]
+        grid = context.reshape(-1, *context.shape[-2:])[select]
+        auxiliary = model.winner_head(flat).float().square().sum(-1).mean()
+        features = {"kind": kind, "cards": cards, "target": target}
+        logits = model.policy_logits(flat, "play", features, None, grid)
+        return auxiliary, logits.float().logsumexp(-1).mean()
+
+    results = []
+    with torch.autocast("mps", dtype=torch.bfloat16):
+        dual = DualTrunkPass(model, tokens)
+        results.append(dual.gradients(list(losses(dual.hidden, dual.context, flat_real)), params))
+        packed_tokens = torch.from_numpy(packing.pack(tokens.cpu().numpy())).to(DEVICE)
+        dual = DualTrunkPass(model, packed_tokens, packing.bounds)
+        assert dual.hidden.shape == (rows, 256)
+        everything = torch.arange(rows, device=DEVICE)
+        results.append(dual.gradients(list(losses(dual.hidden, dual.context, everything)), params))
+    for stream in range(2):
+        for want, have in zip(results[0][stream], results[1][stream]):
+            if want is None:
+                assert have is None
+                continue
+            assert relative(have.float(), want.float()) < 1e-2
+
+
+def test_fused_field_lookups_match_embedding_bag():
+    from cardgym.nn.metal_bag import FieldBags
+
+    generator = torch.Generator().manual_seed(9)
+    tables = [torch.randn(809, width, generator=generator).to(DEVICE).requires_grad_() for width in (256, 768, 384)]
+    ids = torch.stack([torch.randint(start, start + 30, (3000,), generator=generator) for start in range(0, 720, 30)], 1)
+    ids = ids.to(DEVICE)
+    probes = [torch.randn(3000, t.shape[1], device=DEVICE) for t in tables]
+    fused = FieldBags.apply(ids, *tables)
+    reference = [F.embedding_bag(ids, t, mode="sum") for t in tables]
+    for got, want in zip(fused, reference):
+        torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
+    fused_grads = torch.autograd.grad(sum((o * p).sum() for o, p in zip(fused, probes)), tables)
+    want_grads = torch.autograd.grad(sum((o * p).sum() for o, p in zip(reference, probes)), tables)
+    for got, want in zip(fused_grads, want_grads):
+        assert relative(got, want) < 1e-2  # the output gradient is rounded to bf16

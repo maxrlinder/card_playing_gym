@@ -257,11 +257,20 @@ def _train(
     if config.rollout.asynchronous and first <= target:
         from .async_rollout import RolloutProcess
 
+        workers = config.rollout.workers
         rollout = RolloutProcess(
-            config.raw, trainer.actor, seed=config.run.seed * 1_000_003 + first, metal=metal_trunk_requested()
+            config.raw,
+            trainer.actor,
+            seed=config.run.seed * 1_000_003 + first,
+            metal=metal_trunk_requested(),
+            workers=workers,
         )
         rollout.request(trainer.actor, version=first)
-        run.log("Rollout runs in its own process, overlapped with the update.")
+        run.log(
+            "Rollout runs in its own process, overlapped with the update."
+            if workers == 1
+            else f"Rollout runs in {workers} processes, overlapped with the update."
+        )
     try:
         return _loop(run, components, rng, metrics, dashboard, save, args, rollout, first, target, elapsed)
     finally:

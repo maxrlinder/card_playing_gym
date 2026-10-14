@@ -139,6 +139,8 @@ class GridBlock(nn.Module):
         self.register_buffer("spread", torch.ones(NUM_SUITS, 1), persistent=False)
         self._operands_key: tuple | None = None
         self._operands: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._projections_key: tuple | None = None
+        self._projections: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def circulant(self, weight: torch.Tensor | None = None) -> torch.Tensor:
         """The convolution as a [13 * width, 13 * hidden] matrix acting on one suit row."""
@@ -169,6 +171,19 @@ class GridBlock(nn.Module):
                 )
             self._operands_key = key
         return self._operands
+
+    def projection_operands(self, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        """(across weight [hidden, width], out weight [width, hidden]) in ``dtype``, cached like gemm_operands."""
+
+        from cardgym.nn.metal_trunk import optimizer_steps
+
+        across, out = self.across_suits.weight, self.out.weight
+        key = (across._version, out._version, optimizer_steps(), across.device, dtype)
+        if self._projections_key != key:
+            with torch.no_grad():
+                self._projections = (across.detach().to(dtype), out.detach().to(dtype))
+            self._projections_key = key
+        return self._projections
 
     def conv_grad(self, d_circulant: torch.Tensor) -> torch.Tensor:
         """The Conv1d weight gradient [hidden, width, kernel] from the circulant's gradient."""
@@ -239,7 +254,8 @@ class CardGrid(nn.Module):
                 ]
             params.append(self.norm.weight)
             flat = ledger.reshape(-1, NUM_CARDS).long().contiguous()
-            return FusedCardGrid.apply(self, flat, *params).reshape(*lead, NUM_CARDS, self.width)
+            save = torch.is_grad_enabled() and any(p.requires_grad for p in params)
+            return FusedCardGrid.apply(self, flat, save, *params).reshape(*lead, NUM_CARDS, self.width)
         grid = self.code(ledger.long()) + self.rank(self.card_ranks)
         grid = grid.reshape(-1, NUM_SUITS, NUM_RANKS, self.width)
         for block in self.blocks:
@@ -288,10 +304,25 @@ class RummyEmbedding(nn.Module):
         cards, summary = self.grid(tokens[..., LEDGER_START:])
         if self.keep_cards:
             self.kept = cards
+        tables = [self.fields.weight] + [
+            table.weight for table in (self.ple_fields, self.value_fields) if table is not None
+        ]
+        if self.grid.uses_fused(tokens.device):
+            # One fused lookup for every table (cardgym.nn.metal_bag).
+            from cardgym.nn.metal_bag import FieldBags
+
+            sums = [
+                value.view(*ids.shape[:-1], -1)
+                for value in FieldBags.apply(ids.reshape(-1, NUM_FIELDS), *tables)
+            ]
+        else:
+            sums = [_bag(ids, table) for table in tables]
+        sums = iter(sums)
+        fields = next(sums) + summary
         return (
-            _bag(ids, self.fields.weight) + summary,
-            None if self.ple_fields is None else _bag(ids, self.ple_fields.weight),
-            None if self.value_fields is None else _bag(ids, self.value_fields.weight),
+            fields,
+            None if self.ple_fields is None else next(sums),
+            None if self.value_fields is None else next(sums),
         )
 
 

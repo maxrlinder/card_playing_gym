@@ -47,10 +47,24 @@ class SequenceModel(nn.Module):
 
         return self.trunk.condition(*self.embed(tokens))
 
-    def forward_hidden(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Full causal forward; final-norm hidden states [B, T, d]."""
+    def packs(self, device: torch.device) -> bool:
+        """Whether this model can run packed rows (cardgym.nn.packing) on ``device``.
 
-        return self.trunk(*self.prepare(tokens))
+        Packed rows need the fused trunk, whose attention takes per-row
+        sequence bounds; elsewhere padded batches run as they are, which
+        causality keeps exact.
+        """
+
+        return self.trunk.metal is not None and device.type == "mps"
+
+    def forward_hidden(self, tokens: torch.Tensor, bounds: torch.Tensor | None = None) -> torch.Tensor:
+        """Full causal forward; final-norm hidden states [B, T, d].
+
+        With ``bounds`` (int32 [N, 2], see cardgym.nn.packing.Packing) the
+        tokens are packed rows [N, W] and so is the result, [N, d].
+        """
+
+        return self.trunk(*self.prepare(tokens), bounds)
 
     def forward_prefill(
         self, tokens: torch.Tensor, cache: KVCache, rows: torch.Tensor | None

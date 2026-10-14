@@ -190,7 +190,7 @@ class PlumpHooks:
         if not heads and losses.bid_hit <= 0:
             return None
         schema, device = self.schema, self.device
-        rows = hidden.shape[0]
+        rows = dense.rows
         flat = hidden.reshape(-1, hidden.shape[-1])
         with autocast_context(device, self.precision):
             # Project the whole rectangle, then drop padding: faster on MPS
@@ -303,7 +303,7 @@ class PlumpHooks:
         if not heads:
             return None
         schema, device = self.schema, self.device
-        rows = hidden.shape[0]
+        rows = dense.rows
         with autocast_context(device, self.precision):
             flat = hidden.reshape(-1, hidden.shape[-1])
             logits = {name: value[dense.flat] for name, value in critic.auxiliary_logits(flat, heads).items()}

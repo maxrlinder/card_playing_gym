@@ -223,14 +223,16 @@ def tiny_game(**game) -> RummyGame:
 DEVICES = ["cpu"] + (["mps"] if torch.backends.mps.is_available() else [])
 
 
+@pytest.mark.parametrize("cohorts", [1, 2])
 @pytest.mark.parametrize("device", DEVICES)
-def test_continuous_rollout_matches_full_replay(device):
-    """Decoding (cached, gathered rows, refilled slots, carried over) equals a full replay."""
+def test_continuous_rollout_matches_full_replay(device, cohorts):
+    """Decoding (cached, gathered rows, refilled slots, carried over, cohorts) equals a full replay."""
 
     game = tiny_game()
     actor = randomize(game.build_actor().eval(), seed=3, scale=0.2).to(device)
     collector = ContinuousCollector(
         actor, device=torch.device(device), precision="fp32", kv_dtype="fp32", max_length=game.max_length,
+        cohorts=cohorts,
     )
     lanes = [replace(lane, in_flight=lane.quota + 1) for lane in game.lanes(1.0)]
     rng = random.Random(0)

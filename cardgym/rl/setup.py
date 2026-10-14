@@ -110,6 +110,7 @@ def build_components(config: ResolvedConfig, *, device: str | None = None) -> Co
             precision=config.run.precision,
             kv_dtype=config.rollout.kv_dtype,
             max_length=game.max_length,
+            cohorts=config.rollout.cohorts,
         )
     else:
         collector = SelfPlayCollector(

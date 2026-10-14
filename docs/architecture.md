@@ -80,6 +80,10 @@ With `asynchronous = true` the collector runs in its own process and
 collects the next batch while the trainer updates on the current one: an
 iteration costs about max(collect, update). Weights travel through shared
 memory; the rollout process also builds each game's training sequences.
+Collection is host work (game rules and tokens), so `workers` runs several
+such processes, each with its share of every lane and its own seed.
+`cohorts = 2` splits a collector's games into two groups that alternate, the
+host stepping one while the device decodes the other.
 
 Both are off-policy by construction. Every decision records its policy
 version and the exact probabilities it was sampled from, PPO's ratio is
@@ -143,19 +147,37 @@ With continuous or asynchronous collection it also measures policy lag.
   cached attention on MPS).
 * `CARDGYM_METAL_TRUNK=1` on Apple silicon routes the trunk (forward,
   backward, and cached decode, including gathered cache rows) through fused
-  Metal kernels (`cardgym/nn/metal_trunk.py`). Attention tiles keys through
-  threadgroup memory, so any length works. It halved plump's iteration time
-  and matches autocast within bf16 rounding. Games may fuse their own layers
-  under the same switch (Rummy's card grid, `games/rummy/metal_grid.py`).
-* `microbatch_positions` is the update's memory lever; it does not change the
-  accumulated loss.
+  Metal kernels (`cardgym/nn/metal_trunk.py`). It halved plump's iteration
+  time and matches autocast within bf16 rounding. Games may fuse their own
+  layers under the same switch (Rummy's card grid, `games/rummy/metal_grid.py`,
+  and field lookups, `cardgym/nn/metal_bag.py`).
+* **Packed rows.** The fused attention takes each row's sequence bounds, so
+  the update runs every microbatch on its real tokens only
+  (`cardgym/nn/packing.py`): [N, W] rows instead of the padded [B, L, W]
+  group, and every per-position output is addressed by a flat row index.
+  Padding then costs no compute, so groups can be wide (few microbatches).
+  The kernels give each head row a few SIMD lanes and no threadgroup memory:
+  sequences are tens of tokens and attention is a small share of the FLOPs,
+  so occupancy and memory traffic are what count (backward 8.9x faster than
+  the earlier 64-position tiles at 16-token streams).
+* `microbatch_positions` (real tokens when packed) is the update's memory
+  lever; it does not change the accumulated loss.
+* The update never waits on the host: every host array goes up non-blocking
+  (`devices.Uploader`, released after the update's last read), reporting
+  scalars come back in one transfer per phase, and the allocator's cached
+  blocks stay between updates up to a ceiling (0.6 of the device's
+  recommended working set). Each of the three measured 0.2-0.6 s per update.
 * MPS pitfalls that cost more than the arithmetic around them: reducing or
   broadcasting over a middle axis (a suit mean of [N, 4, 13, 32] measured 33
   ms as `mean(dim=1)`, 1.3 ms as a [1, 4] matmul; the backward of a broadcast
-  is that reduction); dtype casts (~0.2 ms of dispatch each); autocast's
+  is that reduction); dtype casts (~0.2-0.5 ms of dispatch each); autocast's
   weight-cast cache, which only works outside `inference_mode` and only until
-  the outermost autocast context exits; and blocking transfers, which wait
-  for all queued work.
+  the outermost autocast context exits; blocking transfers, which wait for
+  all queued work; `vector_norm` (11 ms for 8.7M entries; squares and sums
+  take 1.5 ms); `index_copy` (160 ms to scatter 11k rows; gather through an
+  inverse index instead); `embedding_bag` backward; and GEMMs with one output
+  row and a long K (9 ms for a column sum of 1M rows; fold the sum into a
+  neighbouring weight-gradient GEMM as a ones column).
 * Gradients are given their parameter's layout before each optimizer step:
   fused MPS Adam rejects mismatched strides, which MPS Conv1d backward
   produces.
@@ -174,3 +196,10 @@ lock prevents two trainers from writing one run.
 (weights plus the `[model]` section) and `info.json` (provenance). Releases
 are what gets published; `--init-from` starts a new run from one, with fresh
 optimizer moments under the learning-rate warmup.
+
+`cardgym <game> grow NEW --from RUN --config DEEPER.toml --fresh 4,5,10,11`
+forks a run into a deeper trunk (`rl/grow.py`): trained blocks keep their
+order, fresh blocks start as identities (random weights, zero residual output
+projections, zero per-layer and value embeddings), Adam moments follow their
+parameters, and the iteration, entropy temperatures, and RNG streams carry
+over. The grown model computes exactly what the trained one did.

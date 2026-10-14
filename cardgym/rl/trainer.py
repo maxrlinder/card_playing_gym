@@ -34,10 +34,12 @@ import numpy as np
 import torch
 
 from cardgym.core.devices import (
+    Uploader,
     autocast_context,
     device_allocated_bytes,
     release_device_memory,
 )
+from cardgym.nn.packing import Packing
 
 from .batch import DecisionRows, PPOBatch, RowIndex, SequenceGroup, microbatches
 from .config import PPOConfig
@@ -54,14 +56,50 @@ Totals = dict[str, list[torch.Tensor]]
 
 
 @dataclass
+class Microbatch:
+    """Group rows [start, stop) on the device, padded [B, L, W] or packed [N, W].
+
+    Every per-position model output is addressed through :meth:`flat`: a
+    (sequence, position) pair's row in ``output.reshape(-1, ...)``.
+    """
+
+    start: int
+    stop: int
+    tokens: torch.Tensor
+    length: int  # padded L
+    packing: Packing | None = None
+
+    @property
+    def bounds(self) -> torch.Tensor | None:
+        return None if self.packing is None else self.packing.bounds
+
+    @property
+    def longest(self) -> int:
+        return self.length if self.packing is None else self.packing.longest
+
+    def flat(self, sequence: np.ndarray, position: np.ndarray) -> np.ndarray:
+        if self.packing is None:
+            return sequence * self.length + position
+        return self.packing.flat(sequence, position)
+
+    def per_row(self, values: np.ndarray) -> np.ndarray:
+        """A per-sequence array repeated for each flat row."""
+
+        if self.packing is None:
+            return np.repeat(values, self.length, axis=0)
+        return self.packing.per_row(values)
+
+
+@dataclass
 class DenseRows:
     """The genuine (weighted) positions of one microbatch."""
 
     seq: np.ndarray  # row within the microbatch
     position: np.ndarray
     weight: torch.Tensor  # float32 [N]
-    flat: torch.Tensor  # seq * length + position, for dense projections
+    flat: torch.Tensor  # each position's row in the flattened per-position outputs
     start: int  # first group row of the microbatch
+    rows: int  # sequences in the microbatch
 
     def __len__(self) -> int:
         return int(self.seq.shape[0])
@@ -87,11 +125,58 @@ class TrainingHooks(Protocol):
     def summarize(self, reduced: dict[str, float]) -> dict[str, float]: ...
 
 
-def _norm(gradients: Sequence[torch.Tensor | None] | None) -> float:
-    present = [] if gradients is None else [g for g in gradients if g is not None]
+def _squared_norm(tensors: Sequence[torch.Tensor | None] | None) -> torch.Tensor | None:
+    """Sum of squares of every entry, on the device.
+
+    Squares and sums rather than ``vector_norm``: on MPS a norm of the
+    actor's 8.7M gradient entries measured 11 ms, as one tensor or per tensor;
+    this takes 1.5 ms.
+    """
+
+    present = [] if tensors is None else [t for t in tensors if t is not None]
     if not present:
-        return 0.0
-    return float(torch.linalg.vector_norm(torch.stack([torch.linalg.vector_norm(g) for g in present])))
+        return None
+    return torch.stack([square.sum() for square in torch._foreach_mul(present, present)]).sum()
+
+
+def _norms(*groups: Sequence[torch.Tensor | None] | None) -> list[float]:
+    """The global norm of each group of tensors, with one host read."""
+
+    squares = [_squared_norm(group) for group in groups]
+    present = [square for square in squares if square is not None]
+    values = iter(torch.stack(present).sqrt().tolist() if present else [])
+    return [0.0 if square is None else next(values) for square in squares]
+
+
+def clip_grad_norm(parameters: Sequence[torch.Tensor], max_norm: float) -> float:
+    """``torch.nn.utils.clip_grad_norm_`` with the fast norm above; returns the norm before clipping."""
+
+    grads = [p.grad for p in parameters if p.grad is not None]
+    (norm,) = _norms(grads)
+    scale = max_norm / (norm + 1e-6)
+    if grads and math.isfinite(norm) and scale < 1.0:
+        torch._foreach_mul_(grads, scale)
+    return norm
+
+
+def _reduce(totals: Totals) -> dict[str, float]:
+    """Sum each key's device scalars in float64 on the host, with one transfer.
+
+    A host read per scalar is a device synchronization each; an update
+    collects hundreds of them.
+    """
+
+    keys = [key for key, values in totals.items() if values]
+    if not keys:
+        return {}
+    flat = [value.reshape(()).float() for key in keys for value in totals[key]]
+    host = torch.stack(flat).cpu().double().numpy()
+    reduced, offset = {}, 0
+    for key in keys:
+        count = len(totals[key])
+        reduced[key] = math.fsum(host[offset : offset + count])
+        offset += count
+    return reduced
 
 
 def _accumulate(
@@ -143,6 +228,44 @@ def standardize_grads(parameters: Sequence[torch.Tensor]) -> None:
             parameter.grad = grad.contiguous()
 
 
+# Candidate-list widths at which a head's decisions are split (see _width_buckets).
+WIDTH_BUCKETS = (8, 16)
+MIN_BUCKET_ROWS = 256
+
+
+def _width_buckets(rows: DecisionRows, selected: np.ndarray) -> list[np.ndarray]:
+    """``selected`` split by candidate-list width, so each part is scored at its own width.
+
+    Lists are padded to the longest in the microbatch; Rummy's play lists
+    average 10 legal candidates against a longest of ~37, and scoring at
+    widths 8 / 16 / longest does 42% of the padded work. The policy loss is a
+    weighted sum over rows, so splitting them is exact. Parts smaller than
+    MIN_BUCKET_ROWS join the next wider one (small MPS autograd batches have
+    misbehaved before).
+    """
+
+    if not selected.size:
+        return []
+    legal = rows.probs[selected] > 0
+    width = legal.shape[1] - np.argmax(legal[:, ::-1], axis=1)
+    parts, pending = [], np.zeros(0, dtype=selected.dtype)
+    low = 0
+    for high in (*WIDTH_BUCKETS, int(width.max())):
+        if high <= low:
+            continue
+        pending = np.concatenate([pending, selected[(width > low) & (width <= high)]])
+        if pending.size >= MIN_BUCKET_ROWS:
+            parts.append(pending)
+            pending = np.zeros(0, dtype=selected.dtype)
+        low = high
+    if pending.size:
+        if parts:
+            parts[-1] = np.concatenate([parts[-1], pending])
+        else:
+            parts.append(pending)
+    return parts
+
+
 class PPOTrainer:
     def __init__(
         self,
@@ -178,6 +301,13 @@ class PPOTrainer:
             fused=fused,
         )
         self.entropy = EntropyController(policy_heads, config, device)
+        # Every host array an update reads goes up without draining the queue.
+        self.upload = Uploader(device)
+        self.cache_ceiling = (
+            int(0.6 * torch.mps.recommended_max_memory()) if device.type == "mps" else 0
+        )
+        if hasattr(hooks, "upload"):
+            hooks.upload = self.upload
         self.optimizer_steps = 0
         self._policy_grads: list[torch.Tensor | None] | None = None
         self._auxiliary_grads: list[torch.Tensor | None] | None = None
@@ -201,11 +331,9 @@ class PPOTrainer:
             self.actor_optimizer.zero_grad(set_to_none=True)
             epoch_totals: Totals = defaultdict(list)
             self._actor_backward(batch, indexes, epoch_totals)
-            reduced = {key: math.fsum(float(v) for v in values) for key, values in epoch_totals.items()}
+            reduced = _reduce(epoch_totals)
             policy_norm, auxiliary_norm, scale = self._apply_auxiliary_budget()
-            grad_norm = float(
-                torch.nn.utils.clip_grad_norm_(self.actor_parameters, self.config.max_grad_norm)
-            )
+            grad_norm = clip_grad_norm(self.actor_parameters, self.config.max_grad_norm)
             self._set_learning_rate(iteration)
             if math.isfinite(grad_norm):
                 standardize_grads(self.actor_parameters)
@@ -233,7 +361,13 @@ class PPOTrainer:
         stats["learning_rate"] = float(self.actor_optimizer.param_groups[0]["lr"])
         stats["peak_device_bytes"] = float(device_allocated_bytes(self.device))
         stats.update(self._train_critic(batch))
-        release_device_memory(self.device)
+        # _train_critic ended on a host read of its losses: every upload is done.
+        self.upload.release()
+        # The allocator's cached blocks are the next update's activations:
+        # returning them every update and allocating again measured 0.27 s of
+        # a 2.3 s update. They go back only past a ceiling.
+        if device_allocated_bytes(self.device) > self.cache_ceiling:
+            release_device_memory(self.device)
         stats["update_sec"] = time.perf_counter() - started
         return stats
 
@@ -260,16 +394,12 @@ class PPOTrainer:
         gae = self.config.advantage_estimator == "gae"
         dense_prediction, dense_target, dense_weight = [], [], []
         for group_index, group in enumerate(batch.critic_groups):
-            for start, stop in microbatches(group, self.config.microbatch_positions):
-                tokens = torch.from_numpy(group.tokens[start:stop]).to(self.device)
+            for micro in self._microbatches(self.critic, group):
+                start, stop = micro.start, micro.stop
                 with autocast_context(self.device, self.precision):
-                    values = self.critic.player_values(self.critic.forward_hidden(tokens))
-                counts = torch.from_numpy(group.player_counts[start:stop]).to(self.device)
-                flat_counts = counts[:, None].expand(-1, values.shape[1]).reshape(-1)
-                values = center_zero_sum(
-                    values.float().reshape(-1, values.shape[-1]), flat_counts
-                ).view_as(values)
-                values_np = values.cpu().numpy()
+                    values = self.critic.player_values(self.critic.forward_hidden(micro.tokens, micro.bounds))
+                counts = self.upload(micro.per_row(group.player_counts[start:stop]))
+                values_np = center_zero_sum(values.float().reshape(-1, values.shape[-1]), counts).cpu().numpy()
                 for head, rows in batch.decisions.items():
                     selected = index[head].select(group_index, start, stop)
                     if not selected.size:
@@ -280,7 +410,7 @@ class PPOTrainer:
                     players = group.player_counts[start:stop][seq][:, None]
                     seats = np.arange(self.max_players)[None, :]
                     columns = (seats - rows.critic_shift[selected][:, None]) % players
-                    seat_values = np.take_along_axis(values_np[seq, pos], columns, axis=1) * (seats < players)
+                    seat_values = np.take_along_axis(values_np[micro.flat(seq, pos)], columns, axis=1) * (seats < players)
                     predictions[head][selected] = seat_values[np.arange(selected.size), rows.seat[selected]]
                     if gae:
                         state_values.setdefault(head, np.zeros((len(rows), self.max_players)))
@@ -289,7 +419,7 @@ class PPOTrainer:
                 players = group.player_counts[start:stop][seq_dense]
                 active = np.arange(self.max_players)[None, :] < players[:, None]
                 weight = group.position_weight[start:stop][seq_dense, pos_dense].astype(np.float64)
-                dense_prediction.append(values_np[seq_dense, pos_dense][active])
+                dense_prediction.append(values_np[micro.flat(seq_dense, pos_dense)][active])
                 dense_target.append(group.returns[start:stop][seq_dense][active])
                 dense_weight.append(np.repeat(weight / players, players))
 
@@ -340,15 +470,28 @@ class PPOTrainer:
 
     # -- actor ----------------------------------------------------------- #
 
-    def _dense_rows(self, group: SequenceGroup, start: int, stop: int) -> DenseRows:
-        seq, pos = np.nonzero(group.position_weight[start:stop] > 0)
-        weight = group.position_weight[start:stop][seq, pos]
+    def _microbatches(self, model, group: SequenceGroup):
+        """The group's microbatches on the device: packed rows where the model can run them."""
+
+        packed = model.packs(self.device)
+        for start, stop in microbatches(group, self.config.microbatch_positions, packed=packed):
+            tokens = group.tokens[start:stop]
+            if not packed:
+                yield Microbatch(start, stop, self.upload(tokens), group.length)
+                continue
+            packing = Packing(group.lengths[start:stop], upload=self.upload)
+            yield Microbatch(start, stop, self.upload(packing.pack(tokens)), group.length, packing)
+
+    def _dense_rows(self, group: SequenceGroup, micro: Microbatch) -> DenseRows:
+        seq, pos = np.nonzero(group.position_weight[micro.start : micro.stop] > 0)
+        weight = group.position_weight[micro.start : micro.stop][seq, pos]
         return DenseRows(
             seq=seq,
             position=pos,
-            weight=torch.from_numpy(weight.astype(np.float32)).to(self.device),
-            flat=torch.from_numpy(seq * group.length + pos).to(self.device),
-            start=start,
+            weight=self.upload(weight.astype(np.float32)),
+            flat=self.upload(micro.flat(seq, pos)),
+            start=micro.start,
+            rows=micro.stop - micro.start,
         )
 
     def _actor_backward(
@@ -361,17 +504,16 @@ class PPOTrainer:
         alpha = {head: self.entropy.alpha(head) for head in self.policy_heads}
         budget = self.config.auxiliary_grad_fraction > 0
         for group_index, group in enumerate(batch.actor_groups):
-            for start, stop in microbatches(group, self.config.microbatch_positions):
-                tokens = torch.from_numpy(group.tokens[start:stop]).to(self.device)
+            for micro in self._microbatches(self.actor, group):
                 dual = None
                 with autocast_context(self.device, self.precision):
-                    if budget and self.actor.trunk.uses_metal(self.device, tokens.shape[1]):
-                        dual = DualTrunkPass(self.actor, tokens)
+                    if budget and self.actor.trunk.uses_metal(self.device, micro.longest):
+                        dual = DualTrunkPass(self.actor, micro.tokens, micro.bounds)
                         hidden, context = dual.hidden, dual.context
                     else:
-                        hidden = self.actor.forward_hidden(tokens)
+                        hidden = self.actor.forward_hidden(micro.tokens, micro.bounds)
                         context = self.actor.pop_context()
-                dense = self._dense_rows(group, start, stop)
+                dense = self._dense_rows(group, micro)
                 auxiliary = torch.zeros((), device=self.device)
                 hooked = self.hooks.actor_auxiliary(self.actor, hidden, dense, group, totals)
                 if hooked is not None:
@@ -382,27 +524,26 @@ class PPOTrainer:
                     )
                 policy = torch.zeros((), device=self.device)
                 for head, rows in batch.decisions.items():
-                    selected = indexes[head].select(group_index, start, stop)
-                    if selected.size:
+                    selected = indexes[head].select(group_index, micro.start, micro.stop)
+                    for part in _width_buckets(rows, selected):
                         policy = policy + self._policy_loss(
-                            hidden, tokens, context, rows, selected, start, head, alpha[head], totals
+                            hidden, micro, context, rows, part, head, alpha[head], totals
                         )
                 self._backward(auxiliary, policy, dual)
 
     def _policy_loss(
         self,
         hidden: torch.Tensor,
-        tokens: torch.Tensor,
+        micro: Microbatch,
         context: torch.Tensor | None,
         rows: DecisionRows,
         selected: np.ndarray,
-        start: int,
         head: str,
         alpha: float,
         totals: Totals,
     ) -> torch.Tensor:
-        seq = torch.from_numpy(rows.seq[selected] - start).to(self.device)
-        pos = torch.from_numpy(rows.position[selected]).to(self.device)
+        at = self.upload(micro.flat(rows.seq[selected] - micro.start, rows.position[selected]))
+        tokens = micro.tokens.reshape(-1, micro.tokens.shape[-1])
         # Candidate lists are padded to the batch's longest; trim them to this
         # microbatch's longest (rows.probs is zero past each row's actions).
         width = int(np.flatnonzero(rows.probs[selected].any(axis=0)).max()) + 1
@@ -410,24 +551,28 @@ class PPOTrainer:
             None
             if rows.features is None
             else {
-                key: torch.from_numpy(np.ascontiguousarray(value[selected][:, :width])).to(self.device)
+                key: self.upload(value[selected][:, :width])
                 for key, value in rows.features.items()
             }
         )
         with autocast_context(self.device, self.precision):
             logits = self.actor.policy_logits(
-                hidden[seq, pos], head, features, tokens[seq, pos], None if context is None else context[seq, pos]
+                hidden.reshape(-1, hidden.shape[-1])[at],
+                head,
+                features,
+                tokens[at],
+                None if context is None else context.reshape(-1, *context.shape[-2:])[at],
             )
-        old_probs = torch.from_numpy(np.ascontiguousarray(rows.probs[selected][:, :width])).to(self.device)
+        old_probs = self.upload(rows.probs[selected][:, :width])
         logits = logits.float()[:, :width]
         terms = ppo_terms(
             logits,
             old_probs,
-            torch.from_numpy(rows.action[selected]).to(self.device),
-            torch.from_numpy(rows.advantages[selected]).to(self.device),
+            self.upload(rows.action[selected]),
+            self.upload(rows.advantages[selected]),
             clip_ratio=self.config.clip_ratio,
         )
-        weight = torch.from_numpy(rows.weight[selected]).to(self.device)
+        weight = self.upload(rows.weight[selected])
         loss = (weight * terms.losses).sum()
         eligible = weight * terms.entropy_eligible.float()
         entropy_term = (eligible * terms.normalized_entropy).sum()
@@ -457,8 +602,8 @@ class PPOTrainer:
         with autocast_context(self.device, self.precision):
             values = model.player_values(hidden.reshape(-1, hidden.shape[-1]))
         prediction = values[dense.flat].float()
-        players = torch.from_numpy(group.player_counts[dense.start :][dense.seq]).to(self.device)
-        targets = torch.from_numpy(group.returns[dense.start :][dense.seq]).to(self.device)
+        players = self.upload(group.player_counts[dense.start :][dense.seq])
+        targets = self.upload(group.returns[dense.start :][dense.seq])
         active = (torch.arange(prediction.shape[1], device=self.device)[None, :] < players[:, None]).float()
         prediction = center_zero_sum(prediction, players)
         raw = prediction - targets
@@ -509,24 +654,34 @@ class PPOTrainer:
         self._auxiliary_grads = self._policy_grads = None
         if self.config.auxiliary_grad_fraction <= 0:
             return 0.0, 0.0, 0.0
-        policy_norm = _norm(policy)
-        auxiliary_norm = _norm(auxiliary)
+        policy_norm, auxiliary_norm = _norms(policy, auxiliary)
         if auxiliary_norm <= 0:
             scale = 0.0
         elif policy_norm <= 0:
             scale = 1.0
         else:
             scale = self.config.auxiliary_grad_fraction * policy_norm / auxiliary_norm
+        both = [
+            index for index in range(len(self.actor_parameters))
+            if policy is not None and policy[index] is not None
+            and auxiliary is not None and auxiliary[index] is not None
+        ]
+        if both:
+            # One fused kernel for every parameter both losses reach.
+            torch._foreach_add_([policy[i] for i in both], [auxiliary[i] for i in both], alpha=scale)
         for index, parameter in enumerate(self.actor_parameters):
             p = None if policy is None else policy[index]
             a = None if auxiliary is None else auxiliary[index]
-            if a is not None and scale != 1.0:
-                a.mul_(scale)
-            parameter.grad = a if p is None else (p if a is None else p.add_(a))
+            if p is not None:
+                parameter.grad = p
+            elif a is not None:
+                parameter.grad = a.mul_(scale) if scale != 1.0 else a
+            else:
+                parameter.grad = None
         return policy_norm, auxiliary_norm, scale
 
     def _summarize_actor(self, totals: Totals) -> dict[str, float]:
-        reduced = {key: math.fsum(float(v) for v in values) for key, values in totals.items()}
+        reduced = _reduce(totals)
         epochs = self.config.epochs
         row_weight = max(reduced.get("row_weight", 0.0), 1e-12)
         stats = {
@@ -560,11 +715,10 @@ class PPOTrainer:
             self.critic_optimizer.zero_grad(set_to_none=True)
             pending: list[torch.Tensor] = []
             for group in batch.critic_groups:
-                for start, stop in microbatches(group, self.config.microbatch_positions):
-                    tokens = torch.from_numpy(group.tokens[start:stop]).to(self.device)
+                for micro in self._microbatches(self.critic, group):
                     with autocast_context(self.device, self.precision):
-                        hidden = self.critic.forward_hidden(tokens)
-                    dense = self._dense_rows(group, start, stop)
+                        hidden = self.critic.forward_hidden(micro.tokens, micro.bounds)
+                    dense = self._dense_rows(group, micro)
                     loss = self._value_loss(self.critic, hidden, dense, group, totals, "critic_value")
                     hooked = self.hooks.critic_auxiliary(
                         self.critic, hidden, dense, group, totals, epoch == 0
@@ -573,17 +727,15 @@ class PPOTrainer:
                         loss = loss + hooked
                     loss.backward()
                     pending.append(loss.detach())
-            grad_norm = float(
-                torch.nn.utils.clip_grad_norm_(self.critic_parameters, self.config.max_grad_norm)
-            )
+            grad_norm = clip_grad_norm(self.critic_parameters, self.config.max_grad_norm)
             if math.isfinite(grad_norm):
                 standardize_grads(self.critic_parameters)
                 self.critic_optimizer.step()
             else:
                 self.critic_optimizer.zero_grad(set_to_none=True)
                 skipped += 1
-            epoch_losses.append(math.fsum(float(value) for value in pending))
-        reduced = {key: math.fsum(float(v) for v in values) for key, values in totals.items()}
+            epoch_losses.append(_reduce({"loss": pending}).get("loss", 0.0))
+        reduced = _reduce(totals)
         stats = {
             "critic_grad_norm": grad_norm,
             "skipped_critic_steps": float(skipped),

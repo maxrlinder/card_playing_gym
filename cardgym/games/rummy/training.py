@@ -100,14 +100,13 @@ def training_sequences(trajectory: Trajectory) -> GameSequences:
     return GameSequences(actor=actor, critic=critic, critic_positions=critic_positions)
 
 
-def _labels(group: SequenceGroup, name: str, dense: DenseRows, rows: int, device, per_position: bool):
+def _labels(group: SequenceGroup, name: str, dense: DenseRows, rows: int, upload, per_position: bool):
     array = group.labels[name][dense.start : dense.start + rows]
-    selected = array[dense.seq, dense.position] if per_position else array[dense.seq]
-    return torch.from_numpy(np.ascontiguousarray(selected)).to(device)
+    return upload(array[dense.seq, dense.position] if per_position else array[dense.seq])
 
 
-def _players(group: SequenceGroup, dense: DenseRows, rows: int, device) -> torch.Tensor:
-    return torch.from_numpy(group.player_counts[dense.start : dense.start + rows][dense.seq]).to(device)
+def _players(group: SequenceGroup, dense: DenseRows, rows: int, upload) -> torch.Tensor:
+    return upload(group.player_counts[dense.start : dense.start + rows][dense.seq])
 
 
 def _winner_terms(logits: torch.Tensor, targets: torch.Tensor, players: torch.Tensor):
@@ -129,24 +128,26 @@ class RummyHooks:
         self.losses = losses
         self.device = device
         self.precision = precision
+        # Host arrays -> device; the trainer installs its non-blocking uploader.
+        self.upload = lambda array: torch.from_numpy(np.ascontiguousarray(array)).to(device)
 
     def actor_auxiliary(self, model, hidden, dense: DenseRows, group: SequenceGroup, totals: Totals):
         losses = self.losses
         if max(losses.hands, losses.winner, losses.penalty) <= 0:
             return None
         device = self.device
-        rows = hidden.shape[0]
+        rows = dense.rows
         flat = hidden.reshape(-1, hidden.shape[-1])
         weight = dense.weight
         total = torch.zeros((), device=device)
-        players = _players(group, dense, rows, device)
+        players = _players(group, dense, rows, self.upload)
         with autocast_context(device, self.precision):
             # Project the whole rectangle, then drop padding (faster on MPS).
             hands = model.hands_head(flat)[dense.flat] if losses.hands > 0 else None
             winner = model.winner_head(flat)[dense.flat] if losses.winner > 0 else None
             penalty = model.penalty_head(flat)[dense.flat] if losses.penalty > 0 else None
         if hands is not None:
-            targets = _labels(group, "hands", dense, rows, device, True).long()
+            targets = _labels(group, "hands", dense, rows, self.upload, True).long()
             logits = hands.float().view(len(dense), OPPONENTS, NUM_CARDS, COUNT_CLASSES)
             labeled = targets != IGNORE
             nll = F.cross_entropy(logits.permute(0, 3, 1, 2), targets.clamp_min(0), reduction="none")
@@ -161,7 +162,7 @@ class RummyHooks:
             totals["hands_held_correct"].append((correct & held).sum().detach())
             totals["hands_held_total"].append(held.sum().detach())
         if winner is not None:
-            targets = _labels(group, "winner", dense, rows, device, False)
+            targets = _labels(group, "winner", dense, rows, self.upload, False)
             per_row, correct = _winner_terms(winner, targets, players)
             loss = (per_row * weight).sum()
             total = total + losses.winner * loss
@@ -169,7 +170,7 @@ class RummyHooks:
             totals["winner_correct"].append((correct.float() * weight).sum().detach())
             totals["winner_weight"].append(weight.sum().detach())
         if penalty is not None:
-            targets = _labels(group, "penalty", dense, rows, device, False)
+            targets = _labels(group, "penalty", dense, rows, self.upload, False)
             loss = (_penalty_terms(penalty, targets, players) * weight).sum()
             total = total + losses.penalty * loss
             totals["penalty_loss"].append(loss.detach())
@@ -180,16 +181,16 @@ class RummyHooks:
         if max(losses.winner, losses.penalty) <= 0:
             return None
         device = self.device
-        rows = hidden.shape[0]
+        rows = dense.rows
         flat = hidden.reshape(-1, hidden.shape[-1])
         weight = dense.weight
-        players = _players(group, dense, rows, device)
+        players = _players(group, dense, rows, self.upload)
         total = torch.zeros((), device=device)
         with autocast_context(device, self.precision):
             winner = critic.winner_head(flat)[dense.flat] if losses.winner > 0 else None
             penalty = critic.penalty_head(flat)[dense.flat] if losses.penalty > 0 else None
         if winner is not None:
-            targets = _labels(group, "winner", dense, rows, device, False)
+            targets = _labels(group, "winner", dense, rows, self.upload, False)
             per_row, correct = _winner_terms(winner, targets, players)
             loss = (per_row * weight).sum()
             total = total + losses.winner * loss
@@ -198,7 +199,7 @@ class RummyHooks:
                 totals["oracle_winner_correct"].append((correct.float() * weight).sum().detach())
                 totals["oracle_winner_weight"].append(weight.sum().detach())
         if penalty is not None:
-            targets = _labels(group, "penalty", dense, rows, device, False)
+            targets = _labels(group, "penalty", dense, rows, self.upload, False)
             loss = (_penalty_terms(penalty, targets, players) * weight).sum()
             total = total + losses.penalty * loss
             totals["oracle_penalty_loss"].append(loss.detach())

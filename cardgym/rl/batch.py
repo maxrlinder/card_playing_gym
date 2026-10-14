@@ -59,6 +59,7 @@ class GameSequences:
 @dataclass
 class SequenceGroup:
     tokens: np.ndarray  # [B, L, W]
+    lengths: np.ndarray  # int64 [B]: each row's real tokens (the rest is padding)
     position_weight: np.ndarray  # float32 [B, L]
     player_counts: np.ndarray  # int64 [B]
     # Terminal returns per seat: observer-relative for actor rows (entry 0 is
@@ -230,6 +231,7 @@ def _stack(
         count = len(members)
         token_width = entries[members[0]][0].tokens.shape[1]
         tokens = np.zeros((count, length, token_width), dtype=np.int64)
+        lengths = np.zeros(count, dtype=np.int64)
         position_weight = np.zeros((count, length), dtype=np.float32)
         player_counts = np.zeros(count, dtype=np.int64)
         returns = np.zeros((count, entries[members[0]][3].shape[0]), dtype=np.float32)
@@ -242,6 +244,7 @@ def _stack(
             sequence, weight, players, seat_returns = entries[index]
             size = sequence.tokens.shape[0]
             tokens[row, :size] = sequence.tokens
+            lengths[row] = size
             dense = size - sequence.dense_start
             if dense <= 0:
                 raise AssertionError("A training stream has no dense-supervision positions.")
@@ -258,6 +261,7 @@ def _stack(
         groups.append(
             SequenceGroup(
                 tokens=tokens,
+                lengths=lengths,
                 position_weight=position_weight,
                 player_counts=player_counts,
                 returns=returns,
@@ -346,11 +350,27 @@ class RowIndex:
         return self.order[low:high]
 
 
-def microbatches(group: SequenceGroup, positions: int) -> list[tuple[int, int]]:
-    """Near-equal row ranges of at most ``positions`` tokens (no tiny remainder)."""
+def microbatches(group: SequenceGroup, positions: int, *, packed: bool = False) -> list[tuple[int, int]]:
+    """Row ranges of at most ``positions`` tokens (near-equal, no tiny remainder).
 
-    limit = max(positions // max(group.length, 1), 1)
+    Padded microbatches count every position of the group's length; packed
+    ones (cardgym.nn.packing) count real tokens only.
+    """
+
     count = group.tokens.shape[0]
-    chunks = -(-count // limit)
-    bounds = [count * index // chunks for index in range(chunks + 1)]
+    if not packed:
+        limit = max(positions // max(group.length, 1), 1)
+        chunks = -(-count // limit)
+        bounds = [count * index // chunks for index in range(chunks + 1)]
+        return list(zip(bounds[:-1], bounds[1:]))
+    total = int(group.lengths.sum())
+    chunks = max(1, -(-total // max(positions, 1)))
+    limit = -(-total // chunks)
+    bounds, tokens = [0], 0
+    for row, length in enumerate(group.lengths.tolist()):
+        if tokens + length > limit and row > bounds[-1]:
+            bounds.append(row)
+            tokens = 0
+        tokens += length
+    bounds.append(count)
     return list(zip(bounds[:-1], bounds[1:]))

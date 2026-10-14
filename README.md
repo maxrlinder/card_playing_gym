@@ -46,6 +46,7 @@ you pass `--reconfigure --reason "..."`, which archives the old config and
 records the change. Override single values with `--set section.key=value`.
 For long MPS runs, `tools/train_supervised.sh plump RUN CONFIG` restarts the
 process every 1000 iterations to shed native heap MPS leaks.
+`tools/bench.py` records a run's batches and times its update and rollout.
 
 ## Commands
 
@@ -54,6 +55,7 @@ cardgym games
 cardgym <game> train RUN --config FILE [--set k=v] [--init-from DIR] [--reconfigure --reason ...]
 cardgym <game> dashboard RUN              render runs/<game>/RUN/dashboard.png
 cardgym <game> export RUN --out DIR       publish actor/critic weights as a release
+cardgym <game> grow NEW --from RUN --config FILE --fresh 4,5,...   fork a run into a deeper trunk
 cardgym plump evaluate MODEL [--opponent heuristic|MODEL] [--deals N] [--mode argmax|sample]
 cardgym plump play [MODEL]
 cardgym plump import-legacy CHECKPOINT --out DIR    convert a plump-bot checkpoint
@@ -65,7 +67,8 @@ cardgym rummy simulate [--policy heuristic|random]   rule-based statistics, no m
 
 ```text
 cardgym/core/         run directories, TOML config, metrics, dashboard, devices
-cardgym/nn/           GQA decoder trunk, KV cache, fused Metal trunk (MPS, any length)
+cardgym/nn/           GQA decoder trunk, KV cache, fused Metal trunk (MPS, any length, packed rows),
+                      fused field lookups
 cardgym/rl/           self-play collectors (batch, continuous, async), batches, PPO trainer, checkpoints, run loop
 cardgym/games/base.py the contract a game implements
 cardgym/games/plump/  engine, heuristic, tokens, labels, model, training hooks,

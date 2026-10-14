@@ -330,9 +330,20 @@ class Trunk(nn.Module):
         x: torch.Tensor,
         ple: torch.Tensor | None,
         values: torch.Tensor | None,
+        bounds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Full causal forward over [B, T, d]; returns final-norm hidden states."""
+        """Full causal forward over [B, T, d]; returns final-norm hidden states.
 
+        With ``bounds`` the input is packed rows [N, d] instead (fused trunk
+        only; see :class:`cardgym.nn.packing.Packing`).
+        """
+
+        if bounds is not None:
+            if self.metal is None:
+                raise ValueError("Packed rows need the fused Metal trunk.")
+            from .metal_trunk import run_trunk
+
+            return run_trunk(self, x, ple, values, bounds)
         if self.uses_metal(x.device, x.shape[1]):
             from .metal_trunk import run_trunk
 
