@@ -4,6 +4,7 @@
     cardgym <game> train RUN --config configs/<game>/<preset>.toml [--set k=v ...]
     cardgym <game> dashboard RUN
     cardgym <game> export RUN --out checkpoints/<game>/<name> [--checkpoint latest]
+    cardgym <game> grow NEW --from RUN --config DEEPER.toml --fresh 4,5,10,11
     cardgym <game> <game-specific command> ...
 """
 
@@ -48,6 +49,12 @@ def _add_shared_commands(game: str, commands: argparse._SubParsersAction) -> Non
     export.add_argument("--checkpoint", default="latest")
     export.add_argument("--out", type=Path, required=True)
     export.set_defaults(func=lambda args: _export(game, args))
+
+    from cardgym.rl.grow import add_grow_arguments, grow_command
+
+    grow = commands.add_parser("grow", help="fork a run into a deeper model (fresh identity blocks)")
+    add_grow_arguments(grow)
+    grow.set_defaults(func=lambda args: grow_command(game, args))
 
 
 def _list_games() -> int:
