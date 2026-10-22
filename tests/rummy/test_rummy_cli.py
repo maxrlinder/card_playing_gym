@@ -30,6 +30,11 @@ def test_train_export_evaluate(runs_dir, tmp_path, capsys):
     assert abs(float(history[0]["behavior_kl"])) < 1e-6
     assert float(history[-1]["policy_lag"]) >= 0
     assert float(history[-1]["hands_accuracy"]) > 0
+    # The hold gate: an entropy in bits, a probability, and a sampled rate.
+    assert 0 < float(history[-1]["entropy_hold"]) <= 1
+    assert 0 < float(history[-1]["hold_probability"]) < 1
+    assert float(history[-1]["entropy_target_hold"]) == 0.5
+    assert 0 <= float(history[-1]["hold_rate"]) <= 1
 
     release = tmp_path / "release"
     assert main(["rummy", "export", "smoke", "--out", str(release)]) == 0
@@ -40,7 +45,7 @@ def test_train_export_evaluate(runs_dir, tmp_path, capsys):
     ) == 0
     result = json.loads(report.read_text())
     assert set(result["by_players"]) == {"2", "3"}
-    assert result["by_players"]["3"]["model_alone"]["games"] == 2 * 3
+    assert result["by_players"]["3"]["model_alone"]["games"] == 2 * 2 * 3  # deals x decks x lone seats
     assert "relative reward" in capsys.readouterr().out
 
 
@@ -75,7 +80,7 @@ def test_rollout_workers_share_each_lane(runs_dir, tmp_path):
     with open(runs_dir / "rummy" / "workers" / "metrics.csv", newline="") as handle:
         history = list(csv.DictReader(handle))
     assert [int(row["iteration"]) for row in history] == [1, 2, 3]
-    assert all(int(float(row["games"])) == 4 for row in history)  # 2 lanes x 2 games, split 1 + 1
+    assert all(int(float(row["games"])) == 8 for row in history)  # 4 lanes x 2 games, split 1 + 1
     assert all(float(row["policy_lag"]) >= 1 for row in history[1:])
 
 

@@ -1,9 +1,9 @@
-"""Two standard decks without jokers: 52 card types, two copies of each.
+"""One or two standard decks without jokers: 52 card types, one copy of each per deck.
 
 A card type is ``suit * 13 + rank`` with ranks ordered A, 2, ..., K (rank 0 is
 the Ace). Runs are cyclic, so rank ``r`` is followed by ``(r + 1) % 13`` and
-the King by the Ace. The two physical copies of a type are interchangeable:
-everything here counts copies rather than naming them.
+the King by the Ace. With two decks the two physical copies of a type are
+interchangeable: everything here counts copies rather than naming them.
 """
 
 from __future__ import annotations
@@ -13,7 +13,8 @@ import numpy as np
 NUM_SUITS = 4
 NUM_RANKS = 13
 NUM_CARDS = NUM_SUITS * NUM_RANKS
-COPIES = 2
+MAX_DECKS = 2
+COPIES = MAX_DECKS  # most copies of a card type in play
 NO_CARD = NUM_CARDS  # padding / not-applicable card id
 
 ACE = 0
@@ -57,5 +58,5 @@ def hand_penalty(counts: np.ndarray) -> int:
     return int(np.dot(counts.astype(np.int64), CARD_VALUES))
 
 
-def full_deck() -> list[int]:
-    return [card for card in range(NUM_CARDS) for _ in range(COPIES)]
+def full_deck(decks: int = 1) -> list[int]:
+    return [card for card in range(NUM_CARDS) for _ in range(decks)]

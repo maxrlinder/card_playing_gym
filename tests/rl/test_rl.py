@@ -74,6 +74,45 @@ def test_entropy_controller_tracks_its_target():
     assert controller.alpha("bid") == pytest.approx(ALPHA_MIN)
 
 
+def test_entropy_controller_resumes_with_an_added_head():
+    config = parse_section(PPOConfig, {"entropy_targets": {"bid": 0.5}, "entropy_learning_rate": 0.1}, "ppo")
+    old = EntropyController(("bid", "card"), config, torch.device("cpu"))
+    old.update({"bid": 0.2}, iteration=1)
+    new = EntropyController(("bid", "card", "gate"), config, torch.device("cpu"))
+    new.load_state_dict(old.state_dict())
+    assert new.alpha("bid") == pytest.approx(old.alpha("bid"))
+    moments = new.optimizer.state[new.log_alpha["bid"]]["exp_avg"]
+    assert torch.equal(moments, old.optimizer.state[old.log_alpha["bid"]]["exp_avg"])
+    assert new.log_alpha["gate"] not in new.optimizer.state
+    new.update({"bid": 0.2, "gate": 0.1}, iteration=2)  # the added head steps from fresh moments
+
+
+def test_a_gated_head_measures_only_the_choice_within_a_side():
+    from cardgym.rl.trainer import _within_side_entropy
+
+    logits = torch.tensor([[1.0, 0.0, 2.0, -1.0, 0.5], [0.3, 0.0, 0.0, 0.0, 0.0]])
+    legal = torch.tensor([[True, True, True, True, True], [True, True, True, False, False]])
+    side = torch.tensor([[False, False, True, True, True], [False, False, False, True, True]])
+    log_probs = torch.where(legal, torch.log_softmax(logits.masked_fill(~legal, float("-inf")), -1), 0.0)
+    total, mass = _within_side_entropy(log_probs, legal, side)
+    p = torch.softmax(logits[0], -1)
+    plays, holds = p[:2], p[2:]
+    within = lambda q: -(q / q.sum() * (q / q.sum()).log()).sum()  # noqa: E731
+    expected = plays.sum() * within(plays) / np.log(2) + holds.sum() * within(holds) / np.log(3)
+    assert total[0].item() == pytest.approx(expected.item(), rel=1e-5)
+    assert mass[0].item() == pytest.approx(1.0, rel=1e-5)
+    # Chain rule: the full entropy is the split's entropy plus the within-side part.
+    split = -(plays.sum() * plays.sum().log() + holds.sum() * holds.sum().log())
+    full = -(p * p.log()).sum()
+    assert full.item() == pytest.approx(
+        (split + plays.sum() * within(plays) + holds.sum() * within(holds)).item(), rel=1e-5
+    )
+    # One side legal: the plain normalized entropy.
+    q = torch.softmax(logits[1, :3], -1)
+    assert total[1].item() == pytest.approx((-(q * q.log()).sum() / np.log(3)).item(), rel=1e-5)
+    assert mass[1].item() == pytest.approx(1.0)
+
+
 def test_entropy_target_schedule_interpolates():
     config = parse_section(
         PPOConfig,
@@ -159,6 +198,15 @@ def test_small_buckets_merge_upward_and_microbatches_balance():
     assert microbatches(Group(5, 10), 1000) == [(0, 5)]
     spans = microbatches(Group(101, 64), 640)
     assert max(b - a for a, b in spans) <= 10 and min(b - a for a, b in spans) >= 9
+    # A row slice (one optimizer minibatch) splits only its own rows.
+    assert microbatches(Group(20, 400), 7600, rows=(10, 20)) == [(10, 20)]
+    assert microbatches(Group(3, 400), 7600, rows=(1, 1)) == []
+    halves = [microbatches(Group(101, 64), 640, rows=(a, b)) for a, b in ((0, 50), (50, 101))]
+    assert halves[0][0][0] == 0 and halves[0][-1][1] == 50 and halves[1][0][0] == 50 and halves[1][-1][1] == 101
+    group = Group(7, 64)
+    group.lengths = np.array([10, 30, 5, 40, 20, 25, 15])
+    assert microbatches(group, 50, packed=True, rows=(2, 7)) == [(2, 3), (3, 4), (4, 5), (5, 6), (6, 7)]
+    assert microbatches(group, 80, packed=True, rows=(0, 3)) == [(0, 3)]
 
 
 def test_clip_grad_norm_matches_torch():

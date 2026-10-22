@@ -20,6 +20,7 @@ class PPOTerms:
     entropy: torch.Tensor          # [N] nats
     normalized_entropy: torch.Tensor  # [N] entropy / log(legal count)
     entropy_eligible: torch.Tensor  # [N] more than one legal action
+    log_probs: torch.Tensor        # [N, A] log pi over legal actions (0 elsewhere)
     ratios: torch.Tensor           # [N]
     clipped: torch.Tensor          # [N] |ratio - 1| > clip
 
@@ -65,6 +66,7 @@ def ppo_terms(
         entropy=entropy,
         normalized_entropy=normalized,
         entropy_eligible=eligible,
+        log_probs=safe_log_probs,
         ratios=ratios,
         clipped=(ratios - 1.0).abs() > clip_ratio,
     )

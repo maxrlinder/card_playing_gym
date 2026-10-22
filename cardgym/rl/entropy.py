@@ -2,7 +2,10 @@
 
 The objective adds ``alpha_h * H_norm`` for each policy head ``h``, where
 ``H_norm = H / log|legal|`` is normalized so one temperature means the same
-at every decision width. In adaptive mode each ``log alpha_h`` follows the
+at every decision width. A game may also declare gates (``hooks.gates``):
+a split of one head's candidates into two sides, whose binary entropy
+``H(P(side), 1 - P(side)) / log 2`` gets its own temperature and target the
+same way. In adaptive mode each ``log alpha_h`` follows the
 dual-ascent loss ``log_alpha * (observed - target)``: it rises while the
 observed entropy sits below target and falls above it. Targets are floors in
 practice: an alpha at its lower clamp has no effect.
@@ -87,9 +90,21 @@ class EntropyController:
         }
 
     def load_state_dict(self, state: dict, *, load_optimizer: bool = True) -> None:
+        saved = list(state.get("log_alpha", {}))
         with torch.no_grad():
             for head, value in state.get("log_alpha", {}).items():
                 if head in self.log_alpha:
                     self.log_alpha[head].copy_(value.to(self.device))
         if load_optimizer and self.optimizer is not None and state.get("optimizer"):
-            self.optimizer.load_state_dict(state["optimizer"])
+            # Moments by head name (saved parameters are numbered in head order, as
+            # here), so heads may be added or removed; the learning rate comes from
+            # the current config, not the checkpoint.
+            moments = state["optimizer"]["state"]
+            self.optimizer.load_state_dict({
+                "state": {
+                    self.heads.index(head): moments[index]
+                    for index, head in enumerate(saved)
+                    if head in self.heads and index in moments
+                },
+                "param_groups": self.optimizer.state_dict()["param_groups"],
+            })

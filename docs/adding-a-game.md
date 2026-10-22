@@ -33,6 +33,13 @@ fail):
   none, so private actions can stay private.
 * `done()`, `returns()` (zero-sum per absolute seat), and `lifetime()`
   (expected remaining decisions, used to order games longest-first).
+* Optionally, `context_starts()`: per observer, the index in the blocks the
+  last `step` returned from which the policy starts a fresh context, or
+  None. The collectors restart that observer's KV cache there. The recorded
+  stream keeps every token, and decision positions count from its start.
+  `sequences` must then split the stream the same way: give the seat a list
+  of `TrainingSequence`s, each with its `start` in the stream. Piquet
+  parties restart each deal.
 
 For `[rollout] mode = "continuous"`, also implement `lanes(concurrency)`:
 one `Lane` per game kind with its seat count, its per-update quota, how many
@@ -58,6 +65,12 @@ Subclass `PolicyModel` and `CriticModel` (`cardgym/games/base.py`):
   without encoding the ledger twice.
 * The critic implements `player_values(hidden)` on whatever seat axis its
   stream uses. Absolute seats make value columns name seats directly.
+* The critic is optional: when `build_critic` returns None (and
+  `sequences` returns `critic=None`), the PPO baseline is the actor's own
+  `player_values` at each decision, read by a no-grad pass before the
+  update (or recorded by the collector with each sampled decision, `[ppo]
+  actor_baseline = "rollout"`) and trained through `[ppo] actor_value_coef`
+  (Piquet).
 
 ## 4. Training streams and objectives
 
@@ -88,6 +101,9 @@ iterations. `behavior_kl` should stay at numerical noise.
 * [Plump](plump.md): fixed heads (bid, card), a hand that only shrinks, so
   the event history alone determines the current state.
 * [Rummy](rummy.md): pointer heads over engine-enumerated candidates, and a
-  state that changes in both directions, carried on every token as a card
-  ledger. A game whose state cannot be cheaply recovered from its history
-  should follow it.
+  state that changes in both directions, restated on every decision token as
+  a per-card ledger between tokens that record each opponent turn. A game
+  whose state cannot be cheaply recovered from its history should follow it.
+* [Piquet](piquet.md): fixed card heads with a factorized exchange (one
+  card at a time, then "stop"), a per-card ledger on every token, prediction
+  heads, and no critic.

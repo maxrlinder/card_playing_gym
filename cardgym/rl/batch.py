@@ -3,7 +3,8 @@
 Each trajectory contributes one actor stream per learning seat and either one
 canonical critic stream or one critic stream per seat (the game decides what
 the critic may see; plump's is one perfect-information "oracle" sequence with
-absolute seats, Rummy's a seat-relative oracle stream per seat). Streams are
+absolute seats, Rummy's a seat-relative oracle stream per seat), or none:
+Piquet's baseline is the actor's own value head at each decision. Streams are
 tail-padded to a bucket length and stacked; causal attention makes padding
 after a readout exact.
 
@@ -15,7 +16,9 @@ Weighting (G games, P seats, every seat learning):
 * dense (per-position) losses spread each stream's mass evenly over its
   positions from ``dense_start`` on: an actor stream carries ``1 / (G P)``,
   a canonical critic stream ``1 / G`` (a per-seat one ``1 / (G P)``). Prefix
-  and padding positions weigh zero.
+  and padding positions weigh zero. A seat's stream split into segments
+  (fresh contexts, as each deal of a Piquet partie) shares its mass in
+  proportion to their dense positions: the same weight per position.
 """
 
 from __future__ import annotations
@@ -42,17 +45,24 @@ class TrainingSequence:
     tokens: np.ndarray  # [L, W]
     dense_start: int
     labels: dict[str, np.ndarray] = field(default_factory=dict)
+    # Index of the first token in the seat's whole stream (a segment's offset):
+    # decision positions count from the stream's start.
+    start: int = 0
 
 
 @dataclass
 class GameSequences:
     """What a game derives from one finished trajectory for training."""
 
-    actor: dict[int, TrainingSequence]  # absolute seat -> its own stream
-    # One canonical stream (absolute seats), or seat -> a seat-relative stream.
-    critic: TrainingSequence | dict[int, TrainingSequence]
+    # Absolute seat -> its own stream, or its segments in order when the
+    # game restarts the context (SelfPlayGame.context_starts).
+    actor: dict[int, TrainingSequence | list[TrainingSequence]]
+    # One canonical stream (absolute seats), seat -> a seat-relative stream,
+    # or None for a game without a critic (the actor's value head is the
+    # baseline, read at each decision's own readout).
+    critic: TrainingSequence | dict[int, TrainingSequence] | None
     # Position of each trajectory decision's pre-action state in its critic
-    # stream (the acting seat's, for per-seat critics).
+    # stream (the acting seat's, for per-seat critics); empty without one.
     critic_positions: list[int]
 
 
@@ -95,6 +105,9 @@ class DecisionRows:
     critic_shift: np.ndarray
     features: dict[str, np.ndarray] | None
     advantages: np.ndarray  # float32, filled by the trainer
+    # The actor's raw values recorded at sampling, acting seat first
+    # [N, max_players]; None unless every decision recorded one.
+    values: np.ndarray | None = None
 
     def __len__(self) -> int:
         return int(self.group.shape[0])
@@ -134,16 +147,26 @@ def build_batch(
     game_weight = 1.0 / games
 
     actor_entries: list[tuple[TrainingSequence, float, int, np.ndarray]] = []
-    actor_slot: dict[tuple[int, int], int] = {}
+    # (game, seat) -> its segments as (entry, first stream position), and the seat's weight.
+    actor_slot: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    actor_weight: dict[tuple[int, int], float] = {}
     critic_entries: list[tuple[TrainingSequence, float, int, np.ndarray]] = []
     critic_slot: dict[tuple[int, int | None], int] = {}
     for game_index, (trajectory, derived) in enumerate(zip(trajectories, sequences)):
         players = trajectory.game.num_players
         seat_weight = game_weight / len(derived.actor)
         for seat, sequence in derived.actor.items():
-            actor_slot[(game_index, seat)] = len(actor_entries)
-            actor_entries.append((sequence, seat_weight, players, _relative(trajectory.returns, seat, max_players)))
-        if isinstance(derived.critic, dict):
+            segments = sequence if isinstance(sequence, list) else [sequence]
+            dense = [segment.tokens.shape[0] - segment.dense_start for segment in segments]
+            relative = _relative(trajectory.returns, seat, max_players)
+            actor_slot[(game_index, seat)] = []
+            actor_weight[(game_index, seat)] = seat_weight
+            for segment, positions in zip(segments, dense):
+                actor_slot[(game_index, seat)].append((len(actor_entries), segment.start))
+                actor_entries.append((segment, seat_weight * positions / max(sum(dense), 1), players, relative))
+        if derived.critic is None:
+            pass
+        elif isinstance(derived.critic, dict):
             critic_weight = game_weight / len(derived.critic)
             for seat, sequence in derived.critic.items():
                 critic_slot[(game_index, seat)] = len(critic_entries)
@@ -157,29 +180,39 @@ def build_batch(
     actor_groups, actor_address = _stack(
         actor_entries, actor_labels, bucket_width, max_length, min_group_sequences
     )
-    critic_groups, critic_address = _stack(
-        critic_entries, critic_labels, critic_bucket_width, critic_max_length, min_group_sequences
+    critic_groups, critic_address = (
+        _stack(critic_entries, critic_labels, critic_bucket_width, critic_max_length, min_group_sequences)
+        if critic_entries
+        else ([], [])
     )
 
     columns: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
     features: dict[str, list] = defaultdict(list)
     for game_index, (trajectory, derived) in enumerate(zip(trajectories, sequences)):
-        if len(derived.critic_positions) != len(trajectory.decisions):
+        actor_baseline = derived.critic is None
+        if not actor_baseline and len(derived.critic_positions) != len(trajectory.decisions):
             raise AssertionError("Every decision needs a critic address.")
-        per_seat = isinstance(derived.critic, dict)
-        for order, (record, critic_position) in enumerate(
-            zip(trajectory.decisions, derived.critic_positions)
-        ):
-            slot = actor_slot.get((game_index, record.seat))
-            if slot is None:
+        per_seat = actor_baseline or isinstance(derived.critic, dict)
+        positions = [r.position for r in trajectory.decisions] if actor_baseline else derived.critic_positions
+        for order, (record, critic_position) in enumerate(zip(trajectory.decisions, positions)):
+            segments = actor_slot.get((game_index, record.seat))
+            if segments is None:
                 continue
+            slot, start = next(entry for entry in reversed(segments) if entry[1] <= record.position)
+            position = record.position - start
             group, seq = actor_address[slot]
-            critic_group, critic_seq = critic_address[critic_slot[(game_index, record.seat if per_seat else None)]]
-            weight = actor_entries[slot][1]
+            if actor_baseline:
+                # The "critic" address is the decision's own actor readout.
+                critic_group, critic_seq, critic_position = group, seq, position
+            else:
+                critic_group, critic_seq = critic_address[
+                    critic_slot[(game_index, record.seat if per_seat else None)]
+                ]
+            weight = actor_weight[(game_index, record.seat)]
             column = columns[record.head]
             column["group"].append(group)
             column["seq"].append(seq)
-            column["position"].append(record.position)
+            column["position"].append(position)
             column["action"].append(record.action)
             column["probs"].append(record.probs)
             column["weight"].append(weight)
@@ -191,10 +224,11 @@ def build_batch(
             column["critic_seq"].append(critic_seq)
             column["critic_position"].append(critic_position)
             column["critic_shift"].append(record.seat if per_seat else 0)
+            column["value"].append(record.value)
             features[record.head].append(record.features)
 
     decisions = {
-        head: _decision_rows(column, features[head]) for head, column in sorted(columns.items())
+        head: _decision_rows(column, features[head], max_players) for head, column in sorted(columns.items())
     }
     return PPOBatch(
         actor_groups=actor_groups,
@@ -298,7 +332,7 @@ def merge_small_buckets(buckets: dict[int, list[int]], minimum: int) -> dict[int
     return merged
 
 
-def _decision_rows(column: dict[str, list], features: list) -> DecisionRows:
+def _decision_rows(column: dict[str, list], features: list, max_players: int) -> DecisionRows:
     width = max(len(probs) for probs in column["probs"])
     probs = np.zeros((len(column["probs"]), width), dtype=np.float32)
     for row, value in enumerate(column["probs"]):
@@ -330,6 +364,11 @@ def _decision_rows(column: dict[str, list], features: list) -> DecisionRows:
         critic_shift=as_int("critic_shift"),
         features=stacked,
         advantages=np.zeros(len(column["group"]), dtype=np.float32),
+        values=(
+            None
+            if any(value is None for value in column["value"])
+            else np.stack(column["value"]).astype(np.float32)[:, :max_players]
+        ),
     )
 
 
@@ -350,27 +389,34 @@ class RowIndex:
         return self.order[low:high]
 
 
-def microbatches(group: SequenceGroup, positions: int, *, packed: bool = False) -> list[tuple[int, int]]:
+def microbatches(
+    group: SequenceGroup, positions: int, *, packed: bool = False, rows: tuple[int, int] | None = None
+) -> list[tuple[int, int]]:
     """Row ranges of at most ``positions`` tokens (near-equal, no tiny remainder).
 
     Padded microbatches count every position of the group's length; packed
-    ones (cardgym.nn.packing) count real tokens only.
+    ones (cardgym.nn.packing) count real tokens only. ``rows`` restricts the
+    split to that [first, last) range of the group's rows.
     """
 
-    count = group.tokens.shape[0]
+    first, last = rows if rows is not None else (0, group.tokens.shape[0])
+    count = last - first
+    if count <= 0:
+        return []
     if not packed:
         limit = max(positions // max(group.length, 1), 1)
         chunks = -(-count // limit)
-        bounds = [count * index // chunks for index in range(chunks + 1)]
+        bounds = [first + count * index // chunks for index in range(chunks + 1)]
         return list(zip(bounds[:-1], bounds[1:]))
-    total = int(group.lengths.sum())
+    lengths = group.lengths[first:last]
+    total = int(lengths.sum())
     chunks = max(1, -(-total // max(positions, 1)))
     limit = -(-total // chunks)
-    bounds, tokens = [0], 0
-    for row, length in enumerate(group.lengths.tolist()):
+    bounds, tokens = [first], 0
+    for row, length in enumerate(lengths.tolist(), start=first):
         if tokens + length > limit and row > bounds[-1]:
             bounds.append(row)
             tokens = 0
         tokens += length
-    bounds.append(count)
+    bounds.append(last)
     return list(zip(bounds[:-1], bounds[1:]))

@@ -49,6 +49,8 @@ import torch
 import torch.nn.functional as F
 from torch.optim.optimizer import register_optimizer_step_post_hook
 
+from .metal_decode import decode_post
+from .metal_decode import library as decode_library
 from .trunk import TrunkConfig
 
 ENV_FLAG = "CARDGYM_METAL_TRUNK"
@@ -544,59 +546,71 @@ kernel void attn_decode(
     constant int& gathered [[buffer(13)]],
     uint gid [[thread_position_in_grid]])
 {{
-    const int t = gid % T;
-    const int g = (gid / T) % G;
-    const int j = (gid / (T * G)) % KVH;
-    const int b = gid / (T * G * KVH);
+    // Thread (row b, query head h, token t, lane): DL lanes share one head
+    // row, each holding D / DL dims, as in attn_fwd. Keys before pos0 come
+    // from the cache; the run's own keys from qkv, rounded through fp16 as
+    // the cache stores them (one query head per KV head writes them).
+    const int lane = gid % DL;
+    const int t = (gid / DL) % T;
+    const int h = (gid / (DL * T)) % NH;
+    const int b = gid / (DL * T * NH);
     if (b >= B) return;
+    const int j = h / G;
+    const int d0 = lane * (D / DL);
     const int pos0 = (int)positions[b];
     const long row_b = gathered ? rows[b] : (long)b;
     const long cache_row = (row_b * KVH + j) * max_len;
     const long tok0 = (long)b * T;
-    if (g == 0) {{
+    const bool values = ve_off >= 0;
+    if (h % G == 0) {{
         const long src = (tok0 + t) * QKV_W;
         const int slot = min(pos0 + t, max_len - 1);
-        for (int d = 0; d < D; ++d) {{
-            kc[(cache_row + slot) * D + d] = half(float(qkv[src + K_OFF + j * D + d]));
-            float v = float(qkv[src + V_OFF + j * D + d]);
-            if (ve_off >= 0) v += vemb[(tok0 + t) * ve_stride + ve_off + j * D + d];
-            vc[(cache_row + slot) * D + d] = half(v);
+        device const bfloat4* kq = (device const bfloat4*)(qkv + src + K_OFF + j * D + d0);
+        device const bfloat4* vq = (device const bfloat4*)(qkv + src + V_OFF + j * D + d0);
+        device half4* kw = (device half4*)(kc + (cache_row + slot) * D + d0);
+        device half4* vw = (device half4*)(vc + (cache_row + slot) * D + d0);
+        for (int i = 0; i < V4; ++i) {{
+            kw[i] = half4(float4(kq[i]));
+            float4 v = float4(vq[i]);
+            if (values) v += ((device const float4*)(vemb + (tok0 + t) * ve_stride + ve_off + j * D + d0))[i];
+            vw[i] = half4(v);
         }}
     }}
-    const int h = j * G + g;
-    float q[D];
-    const long qrow = (tok0 + t) * QKV_W + h * D;
-    for (int d = 0; d < D; ++d) q[d] = float(qkv[qrow + d]) * scale_log2;
+    float4 q[V4], acc[V4];
+    device const bfloat4* qp = (device const bfloat4*)(qkv + (tok0 + t) * QKV_W + h * D + d0);
+    for (int i = 0; i < V4; ++i) {{ q[i] = float4(qp[i]) * scale_log2; acc[i] = 0.0f; }}
     float m = -INFINITY, l = 0.0f;
-    float acc[D];
-    for (int d = 0; d < D; ++d) acc[d] = 0.0f;
     const int keys = pos0 + t + 1;
     for (int s = 0; s < keys; ++s) {{
-        float k[D], v[D];
+        float4 k[V4], v[V4];
         if (s < pos0) {{
-            const long at = (cache_row + s) * D;
-            for (int d = 0; d < D; ++d) {{ k[d] = float(kc[at + d]); v[d] = float(vc[at + d]); }}
+            device const half4* kp = (device const half4*)(kc + (cache_row + s) * D + d0);
+            device const half4* vp = (device const half4*)(vc + (cache_row + s) * D + d0);
+            for (int i = 0; i < V4; ++i) {{ k[i] = float4(kp[i]); v[i] = float4(vp[i]); }}
         }} else {{
             const long src = (tok0 + (s - pos0)) * QKV_W;
-            for (int d = 0; d < D; ++d) {{
-                k[d] = float(half(float(qkv[src + K_OFF + j * D + d])));
-                float vv = float(qkv[src + V_OFF + j * D + d]);
-                if (ve_off >= 0) vv += vemb[(tok0 + (s - pos0)) * ve_stride + ve_off + j * D + d];
-                v[d] = float(half(vv));
+            device const bfloat4* kq = (device const bfloat4*)(qkv + src + K_OFF + j * D + d0);
+            device const bfloat4* vq = (device const bfloat4*)(qkv + src + V_OFF + j * D + d0);
+            for (int i = 0; i < V4; ++i) {{
+                k[i] = float4(half4(float4(kq[i])));
+                float4 vv = float4(vq[i]);
+                if (values) vv += ((device const float4*)(vemb + (tok0 + (s - pos0)) * ve_stride + ve_off + j * D + d0))[i];
+                v[i] = float4(half4(vv));
             }}
         }}
-        float score = 0.0f;
-        for (int d = 0; d < D; ++d) score = fma(q[d], k[d], score);
+        float part = 0.0f;
+        for (int i = 0; i < V4; ++i) part += dot(q[i], k[i]);
+        const float score = lane_sum(part);
         const float m_new = max(m, score);
         const float corr = exp2(m - m_new);
         const float p = exp2(score - m_new);
         l = l * corr + p;
-        for (int d = 0; d < D; ++d) acc[d] = fma(p, v[d], acc[d] * corr);
+        for (int i = 0; i < V4; ++i) acc[i] = fma(float4(p), v[i], acc[i] * corr);
         m = m_new;
     }}
     const float inv = 1.0f / l;
-    const long orow = (tok0 + t) * (NH * D) + h * D;
-    for (int d = 0; d < D; ++d) out[orow + d] = bfloat(acc[d] * inv);
+    device bfloat4* op = (device bfloat4*)(out + (tok0 + t) * (NH * D) + h * D + d0);
+    for (int i = 0; i < V4; ++i) op[i] = bfloat4(acc[i] * inv);
 }}
 """
 
@@ -717,6 +731,8 @@ class MetalTrunk:
         self.scale = 1.0 / math.sqrt(self.head_dim)
         self._weight_key: tuple | None = None
         self._weights: list[tuple[torch.Tensor, ...]] = []
+        # decode: fuse everything after attention (cardgym.nn.metal_decode).
+        self.fused_decode = True
         _count_optimizer_steps()
 
     @property
@@ -1042,6 +1058,8 @@ class MetalTrunk:
         if cache_rows is not None:
             cache_rows = cache_rows.to(torch.int64).contiguous()
         cast = self._bf16_weights(params)
+        # Everything after attention as one kernel per layer, where tensor ops run.
+        post = decode_library(self.dm, params[_W1].shape[0], self.ple_dim) if self.fused_decode else None
         _, a, _ = self._add_ln(rows, params[_LN1_W], params[_LN1_B], x=x)
         for layer in range(self.layers):
             p = params[PER_LAYER * layer : PER_LAYER * (layer + 1)]
@@ -1058,14 +1076,21 @@ class MetalTrunk:
                 ve.shape[-1] if ve_off >= 0 else 0, ve_off,
                 self.scale * math.log2(math.e),
                 positions if cache_rows is None else cache_rows, int(cache_rows is not None),
-                threads=batch * self.kv_heads * group * steps, group_size=256,
+                threads=batch * self.n_heads * steps * _lanes(self.head_dim), group_size=256,
             )
+            last = layer == self.layers - 1
+            base = PER_LAYER * (self.layers if last else layer + 1)
+            if post is not None:
+                x, a = decode_post(
+                    post, o, x, wout, p[_LN2_W], p[_LN2_B], w1, p[_B1], w2, p[_B2],
+                    ple_flat, ple_flat.shape[-1] if ple_flat is not None else 0, layer * self.ple_dim,
+                    float(self.ple_scale), params[base], params[base + 1], last=last, eps=float(self.eps),
+                )
+                continue
             x1, m, _ = self._add_ln(
                 rows, p[_LN2_W], p[_LN2_B], x=x, delta=F.linear(o, wout), write_x=True
             )
             down = F.linear(F.gelu(F.linear(m, w1, b1)), w2, b2)
-            last = layer == self.layers - 1
-            base = PER_LAYER * (self.layers if last else layer + 1)
             x, a, _ = self._add_ln(
                 rows, params[base], params[base + 1], x=x1, delta=down,
                 ple=ple_flat, layer=layer, write_x=True, fp32_out=last,

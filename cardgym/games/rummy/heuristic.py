@@ -28,8 +28,13 @@ class RandomPolicy:
 
 
 class HeuristicPolicy:
-    """Greedy: take a discard that makes a new meld, meld and lay off at once,
-    then throw the card with the least meld potential (highest value first)."""
+    """Greedy: take the discard top if it makes a new meld, else dig at most
+    ``max_dig`` cards deep for a card that melds (a deeper card is only offered
+    when it can be used); meld and lay off at once, then throw the card with
+    the least meld potential (highest value first)."""
+
+    def __init__(self, max_dig: int = 3) -> None:
+        self.max_dig = max_dig
 
     def act(self, engine: RummyEngine) -> int:
         candidates = engine.candidates()
@@ -37,8 +42,12 @@ class HeuristicPolicy:
         hand = engine.hands[seat]
         if engine.phase == DRAW:
             for index, action in enumerate(candidates):
-                if action.kind == TAKE and self._wants(engine, seat, action.card):
+                if action.kind != TAKE:
+                    continue
+                if action.meld == 0 and self._wants(engine, seat, action.card):
                     return index
+                if 0 < action.meld < self.max_dig:
+                    return index  # the shallowest usable deeper card
             return next(i for i, action in enumerate(candidates) if action.kind == STOCK)
         melds = [i for i, a in enumerate(candidates) if a.kind in (MELD_GROUP, MELD_RUN)]
         if melds:

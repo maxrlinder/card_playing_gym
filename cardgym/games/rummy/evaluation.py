@@ -46,12 +46,16 @@ class MixedGame(SelfPlayGame):
         self._prefix = self._advance(inner.prefix_tokens())
 
     def _advance(self, blocks: list[np.ndarray]) -> list[np.ndarray]:
-        """Let rule-based seats play up to the next model decision; keep only model seats' tokens."""
+        """Let rule-based seats play up to the next model decision; keep the model seats' tokens."""
 
         engine = self.inner.engine
+        pending = [[block] for block in blocks]
         while not engine.done and engine.current not in self.model_seats:
-            blocks = self.inner.step(self.opponent.act(engine))
-        return [block if seat in self.model_seats else EMPTY for seat, block in enumerate(blocks)]
+            for seat, block in enumerate(self.inner.step(self.opponent.act(engine))):
+                pending[seat].append(block)
+        return [
+            np.concatenate(pending[seat]) if seat in self.model_seats else EMPTY for seat in range(self.num_players)
+        ]
 
     def lifetime(self) -> int:
         return self.inner.lifetime()
@@ -90,24 +94,31 @@ def evaluate(
     deals: int,
     seed: int,
     device: torch.device,
+    decks: tuple[int, ...] = (1,),
     precision: str = "fp32",
-    opening_points: int = 30,
+    opening_points: int = 0,
     max_turns: int = 200,
 ) -> dict:
+    """``deals`` seeded deals per (players, decks); results are reported per player count."""
+
     rng = random.Random(seed)
     lanes: list[Lane] = []
     for players in player_counts:
         games: deque[MixedGame] = deque()
-        for _ in range(deals):
-            deal_seed = rng.getrandbits(48)
-            for lone in range(players):
-                for direction in _directions(players):
-                    seats = frozenset([lone]) if direction == "model_alone" else frozenset(range(players)) - {lone}
-                    policy = HeuristicPolicy() if opponent == "heuristic" else RandomPolicy(deal_seed ^ lone)
-                    inner = RummySelfPlay(
-                        players, hand_size, seed=deal_seed, opening_points=opening_points, max_turns=max_turns
-                    )
-                    games.append(MixedGame(inner, seats, policy, direction))
+        for deck_count in decks:
+            for _ in range(deals):
+                deal_seed = rng.getrandbits(48)
+                for lone in range(players):
+                    for direction in _directions(players):
+                        seats = (
+                            frozenset([lone]) if direction == "model_alone" else frozenset(range(players)) - {lone}
+                        )
+                        policy = HeuristicPolicy() if opponent == "heuristic" else RandomPolicy(deal_seed ^ lone)
+                        inner = RummySelfPlay(
+                            players, hand_size, seed=deal_seed, decks=deck_count,
+                            opening_points=opening_points, max_turns=max_turns,
+                        )
+                        games.append(MixedGame(inner, seats, policy, direction))
         lanes.append(
             Lane(
                 name=f"{players}p",
@@ -190,6 +201,7 @@ def evaluate_command(args: argparse.Namespace) -> int:
         deals=args.deals,
         seed=args.seed,
         device=device,
+        decks=tuple(int(d) for d in args.decks.split(",")),
     )
     result.update({"model": str(args.model), "iteration": iteration, "opponent": args.opponent, "time": timestamp()})
     print(f"{args.model} (iteration {iteration}) vs {args.opponent}: "

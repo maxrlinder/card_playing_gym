@@ -30,15 +30,17 @@ score_dim = 16
 learning_rate = 0.001
 lr_warmup_updates = 1
 clip_ratio = 0.2
+minibatches = 2
 critic_epochs = 2
 value_reward_scale = 50.0
 actor_value_coef = 0.2
 auxiliary_grad_fraction = 0.25
-entropy_targets = { draw = 0.5, play = 0.5 }
+entropy_targets = { draw = 0.5, play = 0.5, hold = 0.5 }
 microbatch_positions = 4096
 
 [game]
 player_counts = [2, 4]
+decks = [1, 2]
 hand_sizes = [7]
 games_per_shape = 2
 max_turns = 40

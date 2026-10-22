@@ -72,7 +72,7 @@ def _dashboard(game: str, args: argparse.Namespace) -> int:
 
     run = RunDirectory(game, args.run)
     config = resolve_config(run.recorded_config())
-    panels = default_panels(config.game.policy_heads) + config.game.dashboard_panels()
+    panels = default_panels(config.game.policy_heads + config.game.entropy_gates) + config.game.dashboard_panels()
     if not render_dashboard(run.metrics, run.dashboard, panels, title=f"{game} / {run.name}"):
         print("No metrics to plot yet.")
         return 1

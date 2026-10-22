@@ -1,0 +1,88 @@
+# Piquet at 16 layers (9.1M parameters, actor only: the value head is the
+# baseline, there is no critic). One deal per game, scored by the point
+# difference.
+#   CARDGYM_METAL_TRUNK=1 tools/train_supervised.sh piquet p1 configs/piquet/base.toml
+
+[run]
+game = "piquet"
+iterations = 1000000
+checkpoint_every = 100
+dashboard_every = 50
+device = "auto"
+precision = "bf16"
+seed = 0
+
+[rollout]
+kv_dtype = "fp16"
+# A third of each update's deals in flight, refilled as they end; one
+# process collects the next batch (~2.4 s) while the update runs. A second
+# worker only slowed the update (GPU and CPU contention): 4.7 s per
+# iteration against 3.8 s with one.
+mode = "continuous"
+concurrency = 0.3333
+asynchronous = true
+workers = 1
+
+[model]
+d_model = 256
+n_layers = 16
+n_heads = 8
+n_kv_heads = 2
+d_ff = 512
+per_layer_dim = 64
+value_embeddings = "alternating"
+card_width = 32
+card_hidden = 64
+card_layers = 2
+card_kernel = 3
+score_dim = 64
+
+[ppo]
+learning_rate = 3e-4
+lr_warmup_updates = 10
+clip_ratio = 0.2
+epochs = 2
+minibatches = 2
+max_grad_norm = 1.0
+advantage_estimator = "monte_carlo"
+# Deal margins are tens of points; a repique swings 60 more.
+value_reward_scale = 30.0
+# The value head is the PPO baseline (no critic), trained by this loss
+# alongside the policy and the prediction heads.
+actor_value_coef = 0.5
+# Its values come with each sampled decision (no pass over the batch before
+# the update; the baseline is then as old as the policy lag, ~1 version).
+actor_baseline = "rollout"
+auxiliary_grad_fraction = 0.25
+# Measure that budget's scale exactly once per update (4 steps) and reuse it
+# for the other three: one backward stream instead of two on those steps.
+auxiliary_grad_refresh = 4
+entropy_mode = "adaptive"
+# Normalized entropy floors (Rummy settled on 0.05 at no cost in strength).
+entropy_targets = { exchange = 0.05, declare = 0.05, play = 0.05 }
+# Streams are at most 64 tokens (about 50): one or two length groups. 16k
+# positions per microbatch peaks at ~5.7 GB on the device (32k: ~8.7 GB, 0.3 s
+# faster per update) to keep memory pressure off the laptop.
+microbatch_positions = 16384
+# Return the allocator's cached blocks past 6 GB (default: ~10 GB here).
+# Measured with one worker: 16k/6 GB 3.8 s per iteration, trainer ~10 GB;
+# 32k/8 GB 3.4 s, trainer peaks at 15 GB.
+device_cache_gb = 6.0
+sequence_bucket_width = 64
+min_group_sequences = 32
+
+[game]
+modes = ["deal"]
+# About 30 decisions and 110 tokens (both seats) per deal.
+games_per_mode = 1024
+
+[losses]
+belief = 0.2
+tricks = 0.1
+declarations = 0.1
+points = 0.1
+bonus = 0.05
+trick = 0.1
+opp_suits = 0.1
+opp_next = 0.1
+fate = 0.1

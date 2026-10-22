@@ -83,7 +83,7 @@ def export_release(
     iteration: int,
     model_config: dict[str, Any],
     actor_state: dict[str, torch.Tensor],
-    critic_state: dict[str, torch.Tensor],
+    critic_state: dict[str, torch.Tensor] | None,
     entropy_state: dict[str, Any] | None,
     source: dict[str, Any],
 ) -> Path:
@@ -101,7 +101,7 @@ def export_release(
             **common,
             "kind": "critic",
             "model": model_config,
-            "state_dict": _cpu(critic_state),
+            "state_dict": None if critic_state is None else _cpu(critic_state),
             "entropy": entropy_state,
         },
         critic_path,

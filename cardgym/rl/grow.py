@@ -230,6 +230,8 @@ def grow_trainer_state(
     grown = dict(trainer)
     torch.manual_seed(seed)
     for role, build in (("actor", "build_actor"), ("critic", "build_critic")):
+        if trainer.get(role) is None:
+            continue  # a game without a critic
         old_model = getattr(old_game, build)()
         new_model = getattr(new_game, build)()
         grown[role] = grow_state(trainer[role], new_model.state_dict(), old_trunk, new_trunk, positions)

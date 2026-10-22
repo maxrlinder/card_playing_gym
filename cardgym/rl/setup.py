@@ -43,7 +43,7 @@ def resolve_config(raw: dict[str, Any]) -> ResolvedConfig:
         parse_section(cls.LossConfig, raw.get("losses"), "losses"),
     )
     ppo = parse_section(PPOConfig, raw.get("ppo"), "ppo")
-    unknown_heads = sorted(set(ppo.entropy_targets) - set(cls.policy_heads))
+    unknown_heads = sorted(set(ppo.entropy_targets) - set(cls.policy_heads) - set(cls.entropy_gates))
     if unknown_heads:
         raise ValueError(f"[ppo] entropy_targets names unknown heads {unknown_heads}.")
     return ResolvedConfig(
@@ -80,6 +80,12 @@ class Components:
     collector: SelfPlayCollector | ContinuousCollector
 
 
+def records_values(config: ResolvedConfig) -> bool:
+    """Whether self-play records the actor's values with each decision (the rollout baseline)."""
+
+    return config.ppo.actor_baseline == "rollout"
+
+
 def build_components(config: ResolvedConfig, *, device: str | None = None) -> Components:
     game = config.game
     target = resolve_device(device if device is not None else config.run.device)
@@ -101,7 +107,7 @@ def build_components(config: ResolvedConfig, *, device: str | None = None) -> Co
         and config.run.precision == "bf16"
     ):
         for model, length in ((trainer.actor, game.max_length), (trainer.critic, game.critic_max_length)):
-            if unsupported_reason(model.trunk_config, length) is None:
+            if model is not None and unsupported_reason(model.trunk_config, length) is None:
                 model.enable_metal_trunk(length)
     if config.rollout.mode == "continuous":
         collector = ContinuousCollector(
@@ -111,6 +117,7 @@ def build_components(config: ResolvedConfig, *, device: str | None = None) -> Co
             kv_dtype=config.rollout.kv_dtype,
             max_length=game.max_length,
             cohorts=config.rollout.cohorts,
+            record_values=records_values(config),
         )
     else:
         collector = SelfPlayCollector(
@@ -121,6 +128,7 @@ def build_components(config: ResolvedConfig, *, device: str | None = None) -> Co
             max_rows=config.rollout.max_rows,
             max_length=game.max_length,
             cohorts=config.rollout.cohorts,
+            record_values=records_values(config),
         )
     return Components(config=config, device=target, trainer=trainer, collector=collector)
 
@@ -131,6 +139,6 @@ def metal_status(components: Components) -> str:
     enabled = [
         name
         for name, model in (("actor", components.trainer.actor), ("critic", components.trainer.critic))
-        if model.trunk.metal is not None
+        if model is not None and model.trunk.metal is not None
     ]
     return ",".join(enabled) if enabled else "requested but unsupported here"

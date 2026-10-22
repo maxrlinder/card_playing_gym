@@ -13,7 +13,7 @@ from cardgym.games.plump.game import PlumpGame
 from cardgym.games.plump.training import PlumpLossConfig
 from cardgym.games.rummy.game import RummyGame, RummyGameConfig
 from cardgym.games.rummy.model import RummyModelConfig
-from cardgym.games.rummy.tokens import FIELD_VOCAB, LEDGER_VOCAB
+from cardgym.games.rummy.tokens import CARD_VOCAB, FIELD_VOCAB
 from cardgym.games.rummy.training import RummyLossConfig
 from cardgym.rl.checkpoint import load_checkpoint
 from cardgym.rl.grow import block_positions, grow_trainer_state
@@ -34,7 +34,7 @@ def rummy_game(layers: int) -> RummyGame:
 def rummy_tokens(batch: int, length: int) -> torch.Tensor:
     generator = torch.Generator().manual_seed(0)
     columns = [torch.randint(0, vocab, (batch, length, 1), generator=generator) for vocab in FIELD_VOCAB]
-    columns.append(torch.randint(0, LEDGER_VOCAB, (batch, length, 52), generator=generator))
+    columns.append(torch.randint(0, CARD_VOCAB, (batch, length, 52), generator=generator))
     return torch.cat(columns, dim=-1)
 
 

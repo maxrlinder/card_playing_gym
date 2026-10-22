@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import random
 from dataclasses import replace
 
@@ -16,13 +17,12 @@ from cardgym.games.rummy.engine import (
     EVENT_MELD,
     EVENT_STOCK,
     EVENT_TAKE,
+    LOC_ABSENT,
     LOC_PILE,
     LOC_TABLE,
-    LOC_TOP,
     LOC_UNSEEN,
-    MAX_PLAYERS,
     NUM_LOCATIONS,
-    NUM_MOVERS,
+    PILE_DEPTHS,
     NUM_PAIRS,
     PAIR,
     PAIR_LOCATIONS,
@@ -30,19 +30,33 @@ from cardgym.games.rummy.engine import (
 )
 from cardgym.games.rummy.game import RummyGame, RummyGameConfig
 from cardgym.games.rummy.heuristic import HeuristicPolicy
+from cardgym.games.rummy.melds import EXTENSIONS
 from cardgym.games.rummy.model import RummyModelConfig
 from cardgym.games.rummy.selfplay import RummySelfPlay
 from cardgym.games.rummy.tokens import (
-    DRAW_ABSENT,
-    DRAW_NONE,
+    CARD_START,
+    CARD_VOCAB,
+    DRAW_DEEP,
     DRAW_STOCK,
-    DRAW_TAKE,
-    F_OPP_DISCARD,
-    F_OPP_DRAW,
-    F_OPP_TAKE,
+    DRAW_TOP,
+    EVENT_BASE,
+    EVENT_PLACE,
+    F_ACTOR,
+    F_DISCARD,
+    F_DRAW,
+    F_HAND,
+    F_KIND,
+    F_LAST_CARD,
+    F_LAYOFFS,
+    F_MELDS,
+    F_OBLIGATION,
     F_PHASE,
-    LEDGER_START,
-    LEDGER_VOCAB,
+    F_STOCK_TOP,
+    F_TAKE_COUNT,
+    F_TAKEN,
+    KIND_DECISION,
+    KIND_TURN,
+    max_stream_length,
 )
 from cardgym.games.rummy.training import IGNORE, RummyLossConfig, training_sequences
 from cardgym.rl.continuous import ContinuousCollector
@@ -56,8 +70,10 @@ for _a in range(NUM_LOCATIONS):
         PAIR_UNSEEN[PAIR[_a, _b]] = LOC_UNSEEN in (_a, _b)
 
 
-def heuristic_round(players: int, seed: int, hand_size: int = 13) -> tuple[RummySelfPlay, list[np.ndarray]]:
-    game = RummySelfPlay(players, hand_size, seed=seed)
+def heuristic_round(
+    players: int, seed: int, hand_size: int = 7, decks: int = 1
+) -> tuple[RummySelfPlay, list[np.ndarray]]:
+    game = RummySelfPlay(players, hand_size, seed=seed, decks=decks)
     policy = HeuristicPolicy()
     streams = [[block] for block in game.prefix_tokens()]
     while not game.done():
@@ -66,102 +82,163 @@ def heuristic_round(players: int, seed: int, hand_size: int = 13) -> tuple[Rummy
     return game, [np.concatenate(blocks) for blocks in streams]
 
 
-def token_events(game: RummySelfPlay, seat: int) -> list[int]:
-    """Events seen before each of the seat's tokens: one token right before each of its own events."""
+class Replay:
+    """One observer's view of the round, rebuilt from the events it saw (not from the engine)."""
 
-    return [index for index, event in enumerate(game.events) if event.actor == seat]
+    def __init__(self, game: RummySelfPlay, observer: int) -> None:
+        engine = RummyEngine(game.num_players, game.hand_size, game.seed, decks=game.decks)  # the same deal
+        self.players = game.num_players
+        self.decks = game.decks
+        self.obligation = NO_CARD
+        self.observer = observer
+        self.own = engine.hands[observer].copy()
+        self.sizes = engine.hands.sum(axis=1)
+        self.known = np.zeros((self.players, NUM_CARDS), dtype=np.int64)
+        self.placed = np.zeros((self.players, NUM_CARDS), dtype=np.int64)
+        self.table: list[int] = []
+        self.pile = [engine.top]
 
-
-def public_pairs(game: RummySelfPlay, observer: int) -> np.ndarray:
-    """The observer's copy-location pairs after 0..E events, rebuilt from what it saw."""
-
-    players = game.num_players
-    engine = RummyEngine(players, game.hand_size, game.seed)  # the same deal
-    own = engine.hands[observer].copy()
-    known = np.zeros((players, NUM_CARDS), dtype=np.int64)
-    table = np.zeros(NUM_CARDS, dtype=np.int64)
-    pile = [engine.top]
-
-    def snapshot() -> np.ndarray:
+    def pairs(self) -> np.ndarray:
         counts = np.zeros((NUM_LOCATIONS, NUM_CARDS), dtype=np.int64)
-        counts[1] = own
-        for offset in range(1, players):
-            counts[1 + offset] = known[(observer + offset) % players]
-        counts[LOC_TABLE] = table
-        for card in pile[:-1]:
-            counts[LOC_PILE, card] += 1
-        if pile:
-            counts[LOC_TOP, pile[-1]] = 1
+        counts[1] = self.own
+        for offset in range(self.players):
+            seat = (self.observer + offset) % self.players
+            if offset:
+                counts[1 + offset] = self.known[seat]
+            counts[LOC_TABLE + offset] = self.placed[seat]
+        for depth, card in enumerate(reversed(self.pile)):
+            counts[LOC_PILE + min(depth, PILE_DEPTHS - 1), card] += 1
+        counts[LOC_ABSENT] = 2 - self.decks
         counts[LOC_UNSEEN] = 2 - counts[1:].sum(axis=0)
         cumulative = counts.cumsum(axis=0)
         return PAIR[(cumulative >= 1).argmax(axis=0), (cumulative >= 2).argmax(axis=0)]
 
-    def leave(actor: int, card: int) -> None:
-        if actor == observer:
-            own[card] -= 1
-        elif known[actor, card]:
-            known[actor, card] -= 1
+    def layable(self) -> np.ndarray:
+        layable = np.zeros(NUM_CARDS, dtype=np.int64)
+        for meld in self.table:
+            for card, _ in EXTENSIONS[meld]:
+                layable[card] = 1
+        return layable
 
-    pairs = [snapshot()]
-    for event in game.events:
+    def leave(self, actor: int, card: int) -> None:
+        self.sizes[actor] -= 1
+        if actor == self.observer:
+            self.own[card] -= 1
+        elif self.known[actor, card]:
+            self.known[actor, card] -= 1
+
+    def apply(self, event) -> None:
         actor = event.actor
         if event.kind == EVENT_STOCK:
-            if actor == observer:
-                own[event.card] += 1
+            self.sizes[actor] += 1
+            if actor == self.observer:
+                self.own[event.card] += 1
         elif event.kind == EVENT_TAKE:
-            assert pile.pop() == event.card
-            if actor == observer:
-                own[event.card] += 1
-            else:
-                known[actor, event.card] += 1
-        elif event.kind in (EVENT_MELD, EVENT_LAYOFF):
+            for card in event.cards:  # top first
+                assert self.pile.pop() == card
+                self.sizes[actor] += 1
+                if actor == self.observer:
+                    self.own[card] += 1
+                else:
+                    self.known[actor, card] += 1
+            assert event.card == event.cards[-1]
+            if actor == self.observer and len(event.cards) > 1:
+                self.obligation = event.card
+        elif event.kind == EVENT_MELD:
+            self.table.append(event.meld)
+        elif event.kind == EVENT_LAYOFF:
+            position = next(
+                i for i, meld in enumerate(self.table) if (event.card, event.meld) in EXTENSIONS[meld]
+            )
+            self.table[position] = event.meld
+        if event.kind in (EVENT_MELD, EVENT_LAYOFF):
             for card in event.cards:
-                leave(actor, card)
-                table[card] += 1
+                self.leave(actor, card)
+                self.placed[actor, card] += 1
+                if actor == self.observer and card == self.obligation:
+                    self.obligation = NO_CARD
         elif event.kind == EVENT_DISCARD:
-            leave(actor, event.card)
-            pile.append(event.card)
-        pairs.append(snapshot())
-    return np.stack(pairs)
+            self.leave(actor, event.card)
+            self.pile.append(event.card)
+
+
+def expected_tokens(game: RummySelfPlay, seat: int) -> list[tuple[int, int]]:
+    """(kind, event index) of each token: a decision before each own event, a turn after each opponent's discard."""
+
+    tokens = []
+    for index, event in enumerate(game.events):
+        if event.actor == seat:
+            tokens.append((KIND_DECISION, index))
+        elif event.kind == EVENT_DISCARD:
+            tokens.append((KIND_TURN, index))
+    return tokens
+
+
+def turn_codes(events, *, oracle: bool) -> np.ndarray:
+    counts = np.zeros((5, NUM_CARDS), dtype=np.int64)
+    for event in events:
+        if event.kind == EVENT_TAKE:
+            for card in event.cards:
+                counts[0, card] += 1
+        elif event.kind == EVENT_STOCK and oracle:
+            counts[1, event.card] += 1
+        elif event.kind == EVENT_MELD:
+            for card in event.cards:
+                counts[2, card] += 1
+        elif event.kind == EVENT_LAYOFF:
+            counts[3, event.card] += 1
+        elif event.kind == EVENT_DISCARD:
+            counts[4, event.card] += 1
+    return EVENT_BASE + np.asarray(EVENT_PLACE) @ counts
 
 
 def test_actor_streams_hold_exactly_public_knowledge():
-    for players in (2, 3, 4):
-        for seed in range(4):
-            game, streams = heuristic_round(players, seed)
-            for seat in range(players):
-                stream = streams[seat].astype(np.int64)
-                seen = token_events(game, seat)
-                assert stream.shape[0] == len(seen)  # one token per own decision
-                expected = public_pairs(game, seat)
-                ledger = stream[:, LEDGER_START:]
-                assert np.array_equal(ledger % NUM_PAIRS, expected[seen])
-                # Mover: who last changed each card type (in this view) since the previous token.
-                mover = (ledger // NUM_PAIRS) % NUM_MOVERS
-                previous = 0
-                for token, now in enumerate(seen):
-                    want = np.zeros(NUM_CARDS, dtype=np.int64)
-                    for count in range(previous + 1, now + 1):
-                        changed = expected[count] != expected[count - 1]
-                        want[changed] = 1 + (game.events[count - 1].actor - seat) % players
-                    want[expected[now] == expected[previous]] = 0
-                    assert np.array_equal(mover[token], want)
-                    # The opponents' turns since the previous token.
-                    for offset in range(1, MAX_PLAYERS):
-                        draw = stream[token, F_OPP_DRAW + offset - 1]
-                        taken = stream[token, F_OPP_TAKE + offset - 1]
-                        discard = stream[token, F_OPP_DISCARD + offset - 1]
-                        if offset >= players:
-                            assert draw == DRAW_ABSENT
-                            continue
-                        moves = [e for e in game.events[previous:now] if e.actor == (seat + offset) % players]
-                        draws = [e for e in moves if e.kind in (EVENT_STOCK, EVENT_TAKE)]
-                        discards = [e for e in moves if e.kind == EVENT_DISCARD]
-                        kind = DRAW_NONE if not draws else DRAW_STOCK if draws[-1].kind == EVENT_STOCK else DRAW_TAKE
-                        assert draw == kind
-                        assert taken == (draws[-1].card if draws and draws[-1].kind == EVENT_TAKE else NO_CARD)
-                        assert discard == (discards[-1].card if discards else NO_CARD)
-                    previous = now
+    deep = 0
+    for players, decks, seed in itertools.product((2, 3, 4), (1, 2), range(4)):
+        game, streams = heuristic_round(players, seed, decks=decks)
+        deep += sum(event.kind == EVENT_TAKE and len(event.cards) > 1 for event in game.events)
+        for seat in range(players):
+            stream = streams[seat].astype(np.int64)
+            expected = expected_tokens(game, seat)
+            assert [kind for kind, _ in expected] == stream[:, F_KIND].tolist()
+            assert len(stream) <= max_stream_length(game.engine.max_turns)
+            replay = Replay(game, seat)
+            applied = 0
+            for token, (kind, index) in zip(stream, expected):
+                if kind == KIND_DECISION:
+                    while applied < index:
+                        replay.apply(game.events[applied])
+                        applied += 1
+                    codes = token[CARD_START:]
+                    assert np.array_equal(codes % NUM_PAIRS, replay.pairs())
+                    assert np.array_equal(codes // NUM_PAIRS, replay.layable())
+                    own = [e for e in game.events[:index] if e.actor == seat]
+                    assert token[F_LAST_CARD] == (own[-1].card if own else NO_CARD)
+                    assert token[F_OBLIGATION] == replay.obligation
+                    assert token[F_PHASE] == int(game.events[index].kind not in (EVENT_STOCK, EVENT_TAKE))
+                else:
+                    actor = game.events[index].actor
+                    start = max(i for i in range(index) if game.events[i].kind in (EVENT_STOCK, EVENT_TAKE))
+                    turn = game.events[start : index + 1]
+                    assert all(event.actor == actor for event in turn)
+                    while applied <= index:
+                        replay.apply(game.events[applied])
+                        applied += 1
+                    assert token[F_ACTOR] == (actor - seat) % players
+                    draw = turn[0]
+                    if draw.kind == EVENT_STOCK:
+                        assert token[F_DRAW] == DRAW_STOCK and token[F_TAKEN] == NO_CARD
+                    else:
+                        assert token[F_DRAW] == (DRAW_TOP if len(draw.cards) == 1 else DRAW_DEEP)
+                        assert token[F_TAKEN] == draw.card and token[F_TAKE_COUNT] == len(draw.cards)
+                    assert token[F_DISCARD] == turn[-1].card
+                    assert token[F_MELDS] == sum(e.kind == EVENT_MELD for e in turn)
+                    assert token[F_LAYOFFS] == sum(e.kind == EVENT_LAYOFF for e in turn)
+                    assert np.array_equal(token[CARD_START:], turn_codes(turn, oracle=False))
+                sizes = [replay.sizes[(seat + j) % players] for j in range(players)]
+                assert token[F_HAND : F_HAND + players].tolist() == sizes
+                assert token[F_STOCK_TOP] == NO_CARD
+    assert deep > 0  # the heuristic digs, so deep pickups are covered
 
 
 def test_oracle_streams_see_every_hand():
@@ -170,12 +247,22 @@ def test_oracle_streams_see_every_hand():
         for seat in range(players):
             oracle = np.stack(game.oracle[seat]).astype(np.int64)
             hands = np.stack(game.hands[seat]).astype(np.int64)  # [L, P, 52]
-            assert oracle.shape == streams[seat].shape
-            assert np.array_equal(oracle[:, F_PHASE], streams[seat][:, F_PHASE])
-            locations = PAIR_LOCATIONS[oracle[:, LEDGER_START:] % NUM_PAIRS]  # [L, 52, 2]
+            stream = streams[seat].astype(np.int64)
+            assert oracle.shape == stream.shape
+            decision = stream[:, F_KIND] == KIND_DECISION
+            # Same fields except the stock top and, on turn tokens, the card drawn.
+            same = np.ones(F_STOCK_TOP, dtype=bool)
+            assert np.array_equal(oracle[decision, :F_STOCK_TOP], stream[decision, :F_STOCK_TOP])
+            same[F_TAKEN] = False
+            assert np.array_equal(oracle[~decision, :F_STOCK_TOP][:, same], stream[~decision, :F_STOCK_TOP][:, same])
+            locations = PAIR_LOCATIONS[oracle[decision, CARD_START:] % NUM_PAIRS]  # [D, 52, 2]
             for offset in range(players):
                 held = (locations == 1 + offset).sum(axis=-1)
-                assert np.array_equal(held, hands[:, (seat + offset) % players])
+                assert np.array_equal(held, hands[decision][:, (seat + offset) % players])
+            # Turn tokens: stock draws are visible to the oracle only.
+            turns = ~decision
+            assert np.all(oracle[turns, F_TAKEN] != NO_CARD)
+            assert np.all(oracle[turns, CARD_START:] >= stream[turns, CARD_START:])
 
 
 def test_training_sequences_and_belief_masks():
@@ -186,11 +273,10 @@ def test_training_sequences_and_belief_masks():
             self.seat, self.head, self.position = seat, head, position
 
     decisions = []
-    seen = [0] * game.num_players
-    for event in game.events:
+    for event_index, event in enumerate(game.events):
         head = "draw" if event.kind in (EVENT_STOCK, EVENT_TAKE) else "play"
-        decisions.append(Record(event.actor, head, seen[event.actor]))
-        seen[event.actor] += 1
+        position = expected_tokens(game, event.actor).index((KIND_DECISION, event_index))
+        decisions.append(Record(event.actor, head, position))
 
     class Trajectory:
         pass
@@ -203,10 +289,11 @@ def test_training_sequences_and_belief_masks():
     assert set(sequences.critic) == set(sequences.actor) == {0, 1, 2}
     for seat, sequence in sequences.actor.items():
         hands = sequence.labels["hands"]
-        assert hands.shape == (len(streams[seat]), 3, NUM_CARDS)
+        stream = streams[seat].astype(np.int64)
+        assert hands.shape == (len(stream), 3, NUM_CARDS)
         assert np.all(hands[:, 2] == IGNORE)  # no fourth seat at a 3-player table
-        # Cards the viewer can place exactly are never supervised.
-        unseen = PAIR_UNSEEN[streams[seat][:, LEDGER_START:].astype(np.int64) % NUM_PAIRS]
+        # Cards the viewer can place exactly are never supervised, nor are turn tokens.
+        unseen = PAIR_UNSEEN[stream[:, CARD_START:] % NUM_PAIRS] & (stream[:, F_KIND, None] == KIND_DECISION)
         assert np.all((hands[:, :2] == IGNORE) == ~unseen[:, None, :])
 
 
@@ -269,7 +356,7 @@ def test_card_grid_is_suit_equivariant():
 
     torch.manual_seed(0)
     grid = randomize(tiny_game().build_actor(), seed=1, scale=0.1).embedding.grid.eval()
-    ledger = torch.randint(0, LEDGER_VOCAB, (6, NUM_CARDS))
+    ledger = torch.randint(0, CARD_VOCAB, (6, NUM_CARDS))
     permutation = torch.tensor([2, 0, 3, 1])  # new suit of each old suit
     cards = torch.arange(NUM_CARDS)
     moved = permutation[cards // 13] * 13 + cards % 13

@@ -79,6 +79,44 @@ def test_metrics_widen_header_and_truncate(tmp_path):
     assert [row["iteration"] for row in MetricsLog(tmp_path / "metrics.csv").read()] == ["1"]
 
 
+def test_dashboard_log_axes_and_caps(tmp_path):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    from cardgym.core.dashboard import Panel, _limit, _smooth, render_dashboard
+
+    norms = np.full(500, 2.0)
+    norms[100], norms[200], norms[300] = 1e19, np.inf, np.nan
+    assert np.isfinite(_smooth(norms, log=True)).all()
+    assert np.isfinite(_smooth(norms)).all()
+
+    _, axis = plt.subplots()
+    axis.plot(norms)
+    _limit(axis, Panel("norms", ("g",), log=True, robust=True), [norms])
+    assert axis.get_yscale() == "log" and axis.get_ylim()[1] < 10
+
+    seconds = np.linspace(1.0, 25.0, 50)
+    _, axis = plt.subplots()
+    axis.plot(seconds)
+    _limit(axis, Panel("sec", ("s",), top=10.0), [seconds])
+    assert axis.get_ylim()[1] == 10.0
+    _, axis = plt.subplots()
+    axis.plot(seconds / 10)
+    _limit(axis, Panel("sec", ("s",), top=10.0), [seconds / 10])
+    assert axis.get_ylim()[1] < 3.0  # a cap, not a fixed range
+    plt.close("all")
+
+    log = MetricsLog(tmp_path / "metrics.csv")
+    for iteration, norm in enumerate(norms, 1):
+        log.append({"iteration": iteration, "g": norm, "s": 2.0})
+    panels = [Panel("norms", ("g",), log=True, robust=True), Panel("sec", ("s",), top=10.0)]
+    assert render_dashboard(tmp_path / "metrics.csv", tmp_path / "dashboard.png", panels, title="t")
+    assert (tmp_path / "dashboard.png").is_file()
+
+
 def test_run_directory_manifest_and_lock(runs_dir):
     run = RunDirectory("plump", "demo")
     run.create({"run": {"game": "plump"}}, ["cardgym"])

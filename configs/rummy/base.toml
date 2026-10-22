@@ -52,17 +52,20 @@ actor_value_coef = 0.2
 auxiliary_grad_fraction = 0.25
 entropy_mode = "adaptive"
 entropy_targets = { draw = 0.15, play = 0.15 }
-# One token per own decision: streams are tens of tokens, rarely past 128.
+# Own decisions plus opponent turns: streams are ~40 tokens, rarely past 128.
 microbatch_positions = 16384
 sequence_bucket_width = 16
 critic_sequence_bucket_width = 16
 min_group_sequences = 32
 
 [game]
+# Every (players, decks, hand size) combination is a lane: an update mixes
+# 2-4 players with one and two decks, seven cards each.
 player_counts = [2, 3, 4]
-hand_sizes = [13]
-games_per_shape = 48
-opening_points = 30
+decks = [1, 2]
+hand_sizes = [7]
+games_per_shape = 24
+opening_points = 0
 max_turns = 200
 
 [losses]

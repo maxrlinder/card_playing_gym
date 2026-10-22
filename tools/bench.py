@@ -7,8 +7,9 @@
 ``record`` collects batches in-process with the run's latest weights and
 config (after warm-up collections, so the continuous pool is in its steady
 state) and pickles the PPO batches. ``update`` replays them through
-``PPOTrainer.update`` and splits the time into the critic baseline, the actor
-epochs, and the critic epochs (each phase ends with a device synchronize).
+``PPOTrainer.update`` and splits the time into the critic baseline (or, for a
+game without a critic, the actor's value pass), the actor steps, and the
+critic epochs (each phase ends with a device synchronize).
 ``rollout`` times synchronous collections. ``--set`` overrides config values
 (not [model]) for the measurement.
 """
@@ -98,8 +99,8 @@ class _Phases:
     def __init__(self, trainer) -> None:
         self.trainer = trainer
         self.times: dict[str, list[float]] = {}
-        for name, label in (("_prepare_advantages", "baseline"), ("_actor_backward", "actor"),
-                            ("_train_critic", "critic")):
+        for name, label in (("_baseline", "baseline"), ("_actor_baseline", "value"),
+                            ("_actor_backward", "actor"), ("_critic_epoch", "critic")):
             self._wrap(name, label)
 
     def _wrap(self, name: str, label: str) -> None:
@@ -137,8 +138,10 @@ def update(args: argparse.Namespace) -> int:
             actor = sum(phases.times.get("actor", []))
             other = elapsed - sum(sum(v) for v in phases.times.values())
             line = (
-                f"pass {repeat} batch {index}: {elapsed:.3f}s = baseline {sum(phases.times['baseline']):.3f} "
-                f"+ actor {actor:.3f} ({len(phases.times['actor'])} epochs) + critic {sum(phases.times['critic']):.3f} "
+                f"pass {repeat} batch {index}: {elapsed:.3f}s = baseline (host) {sum(phases.times['baseline']):.3f} "
+                f"+ value pass {sum(phases.times.get('value', [])):.3f} "
+                f"+ actor {actor:.3f} ({len(phases.times['actor'])} steps) "
+                f"+ critic {sum(phases.times.get('critic', [])):.3f} "
                 f"+ steps/other {other:.3f} | positions {stats['positions']:.0f} rows {stats['policy_rows']:.0f} "
                 f"peak {stats['peak_device_bytes'] / 2**30:.2f} GiB"
             )

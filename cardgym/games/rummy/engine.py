@@ -1,28 +1,42 @@
 """The Rummy round: rules, legal moves, scoring, and every viewer's card ledger.
 
-Variant (``rummy-bot``'s ``rules.txt`` with its documented interpretations):
-two decks without jokers, cyclic runs, 2-4 players, a configurable hand size,
-and a 30-point opening. A turn is
+Variant: Scandinavian rummy with 500 Rum's discard pile and scoring. One deck
+by default (two as an option), no jokers, cyclic runs, 2-4 players, seven
+cards each by default. A turn is
 
-    draw (stock or the discard top) -> any number of melds / lay-offs -> discard
+    draw (the stock, or any discard with every card above it) -> any number of melds / lay-offs -> discard
 
-* **Opening.** Until a seat has opened, its melds this turn must total at
-  least ``opening_points``. Melds are laid one at a time; a meld is legal only
-  if the rest of the hand can still complete the threshold (``melds.
-  opening_melds``), and the seat may not discard or lay off until it has.
-  Laying them in sequence within one turn is the same as laying them at once:
-  nobody else acts in between.
+* **Drawing.** Take the stock's top card, or a card in the discard pile
+  together with every card above it. The top card alone may be kept; a deeper
+  card obliges the seat to meld it or lay it off this turn (the cards above
+  it go to the hand), so a deeper card is offered only when that is possible:
+  directly, in a meld from the hand, or at the end of a chain of lay-offs
+  that extends a table run up to it (2-3-4 on the table, 5 in hand: the 6).
+  Until it has been used the seat may only make the melds and lay-offs that
+  use it, and the lay-offs that start such a chain.
+* **Opening.** None by default: any seat may meld and lay off from its first
+  turn. ``opening_points > 0`` restores a threshold: until a seat has opened,
+  its melds in one turn must total at least that many points, laid one at a
+  time; a meld is legal only if the rest of the hand can still complete the
+  threshold (``melds.opening_melds``), and the seat may not discard or lay
+  off until it has.
 * **Hand floor.** A meld or lay-off never takes the last card: a round is won
   by discarding it.
-* **End.** Discarding the last card wins: the others lose their hand values
-  and the winner gains the sum, doubled for going Rummy (opening and going
-  out in one turn while the table was empty at its start). Drawing the last
-  stock card ends the round at the end of that turn, without a winner if the
-  drawer does not go out: everyone loses their hand value. ``max_turns`` is a
-  safety bound with the same scoring, reported as ``truncated``.
+* **One route per outcome.** An opened seat melds exactly three cards and
+  adds any more by lay-offs (4-5-6, then 7), which scores the same as the
+  longer meld: every card beyond three is a separate decision to play it or
+  hold it. An unopened seat's opening melds keep every size, since the
+  threshold search counts them whole.
+* **Scoring.** Every card a seat melds or lays off scores its points for that
+  seat (``melds.MELD_POINTS``; a lay-off scores what it adds to the meld).
+  When the round ends, the cards left in each hand count against it (Ace 11,
+  faces 10, pips face value). The round ends when a seat discards its last
+  card, or at the end of the turn that drew the last stock card.
+  ``max_turns`` is a safety bound with the same scoring, reported as
+  ``truncated``.
 
 The ledger is the per-viewer card-location state the model reads: for every
-card type, where its two copies are, as far as the viewer knows for certain.
+card type, where its copies are, as far as the viewer knows for certain.
 """
 
 from __future__ import annotations
@@ -33,8 +47,20 @@ from typing import NamedTuple
 
 import numpy as np
 
-from .cards import COPIES, NO_CARD, NUM_CARDS, full_deck, hand_penalty
-from .melds import EXTENSIONS, GROUP, MELD_CARDS, MELD_KIND, MELD_POINTS, hand_melds, opening_melds
+from .cards import COPIES, MAX_DECKS, NO_CARD, NUM_CARDS, NUM_RANKS, card_id, full_deck, hand_penalty
+from .melds import (
+    EXTENSIONS,
+    FULL_RUN,
+    GROUP,
+    MELD_CARDS,
+    MELD_KIND,
+    MELD_POINTS,
+    MELDS,
+    RUN,
+    can_meld,
+    hand_melds,
+    opening_melds,
+)
 
 MAX_PLAYERS = 4
 
@@ -51,33 +77,36 @@ EVENT_DEAL, EVENT_STOCK, EVENT_TAKE, EVENT_MELD, EVENT_LAYOFF, EVENT_DISCARD = r
 # Ledger locations. Location 1 + j is seat j's hand: for an observer, the
 # observer itself (j = 0, fully known) and the copies each opponent is
 # publicly known to hold (taken from the discard pile and not since played);
-# for the oracle, absolute seat j's whole hand. Location 0 is everything else
-# (the observer's "unseen"; the oracle's stock).
+# for the oracle, absolute seat j's whole hand. Location LOC_TABLE + j is the
+# table, copies seat j put there (melded or laid off). LOC_PILE + d is the
+# discard pile at depth d (0 is the top; the last depth holds everything
+# deeper). LOC_ABSENT holds the copies a one-deck game does not have.
+# Location 0 is everything else (the observer's "unseen"; the oracle's stock).
 LOC_UNSEEN = 0
 LOC_TABLE = 1 + MAX_PLAYERS
-LOC_PILE = 2 + MAX_PLAYERS  # discard pile below the top
-LOC_TOP = 3 + MAX_PLAYERS  # discard top
-NUM_LOCATIONS = 4 + MAX_PLAYERS
+PILE_DEPTHS = 11
+LOC_PILE = 1 + 2 * MAX_PLAYERS
+LOC_TOP = LOC_PILE
+LOC_ABSENT = LOC_PILE + PILE_DEPTHS
+NUM_LOCATIONS = LOC_ABSENT + 1
 
-# The two copies' locations as an unordered pair: 36 codes.
+# The two copies' locations as an unordered pair: 231 codes.
 PAIR = np.zeros((NUM_LOCATIONS, NUM_LOCATIONS), dtype=np.int64)
 _pairs = [(a, b) for a in range(NUM_LOCATIONS) for b in range(a, NUM_LOCATIONS)]
 for _code, (_a, _b) in enumerate(_pairs):
     PAIR[_a, _b] = PAIR[_b, _a] = _code
 NUM_PAIRS = len(_pairs)
-PAIR_LOCATIONS = np.array(_pairs, dtype=np.int64)  # [36, 2]
-# Who last moved a card type, as the viewer sees it: nobody since the viewer's
-# previous token, the viewer itself, or opponent 1..3 (observer-relative).
-NUM_MOVERS = 1 + MAX_PLAYERS
-# A ledger code is pair + NUM_PAIRS * (mover + NUM_MOVERS * layable).
-NUM_LEDGER_CODES = NUM_PAIRS * NUM_MOVERS * 2
+PAIR_LOCATIONS = np.array(_pairs, dtype=np.int64)  # [231, 2]
+# A state code is pair + NUM_PAIRS * layable.
+NUM_STATE_CODES = NUM_PAIRS * 2
 
 
 def _pair_rotations() -> dict[int, np.ndarray]:
     """``ROTATE[players][seat]`` maps an absolute-seat pair code to seat-relative.
 
-    Location ``1 + j`` (absolute seat ``j``'s hand) becomes ``1 + (j - seat) %
-    players``; every other location is unchanged.
+    Locations ``1 + j`` and ``LOC_TABLE + j`` (absolute seat ``j``'s hand and
+    the copies it tabled) move to ``j - seat`` mod ``players``; every other
+    location is unchanged.
     """
 
     rotations = {}
@@ -85,7 +114,9 @@ def _pair_rotations() -> dict[int, np.ndarray]:
         table = np.zeros((players, NUM_PAIRS), dtype=np.int64)
         for seat in range(players):
             location = np.arange(NUM_LOCATIONS)
-            location[1 : 1 + players] = 1 + (np.arange(players) - seat) % players
+            relative = (np.arange(players) - seat) % players
+            location[1 : 1 + players] = 1 + relative
+            location[LOC_TABLE : LOC_TABLE + players] = LOC_TABLE + relative
             for code, (a, b) in enumerate(_pairs):
                 table[seat, code] = PAIR[location[a], location[b]]
         rotations[players] = table
@@ -94,26 +125,25 @@ def _pair_rotations() -> dict[int, np.ndarray]:
 
 ROTATE = _pair_rotations()
 
-# A card type's copies over the locations as one number, sum_l count_l * 3^l
-# (counts are 0..2, so it is injective), and that number's pair code.
-LOCATION_WEIGHTS = 3 ** np.arange(NUM_LOCATIONS, dtype=np.int64)
-PAIR_OF_CODE = np.zeros(3**NUM_LOCATIONS, dtype=np.int64)
-for _a in range(NUM_LOCATIONS):
-    for _b in range(_a, NUM_LOCATIONS):
-        PAIR_OF_CODE[LOCATION_WEIGHTS[_a] + LOCATION_WEIGHTS[_b]] = PAIR[_a, _b]
+
+def pair_codes(counts: np.ndarray) -> np.ndarray:
+    """Pair codes [..., 52] from copy counts [..., NUM_LOCATIONS, 52] that sum to 2 per card."""
+
+    cumulative = counts.cumsum(axis=-2)
+    return PAIR[(cumulative >= 1).argmax(axis=-2), (cumulative >= 2).argmax(axis=-2)]
 
 
 class Action(NamedTuple):
     kind: int
-    card: int = NO_CARD  # TAKE / LAYOFF / DISCARD
-    meld: int = -1  # MELD: meld index; LAYOFF: table position
+    card: int = NO_CARD  # TAKE (the deepest card taken) / LAYOFF / DISCARD
+    meld: int = -1  # MELD: meld index; LAYOFF: table position; TAKE: cards taken above the card
 
 
 @dataclass(frozen=True)
 class Event:
     kind: int
     actor: int
-    card: int  # NO_CARD for melds
+    card: int  # NO_CARD for melds; the deepest card for a take
     meld: int  # MELD: new meld; LAYOFF: extended meld; else -1
     cards: tuple[int, ...]  # card types that left the actor's hand (or entered it on a draw)
 
@@ -125,19 +155,23 @@ class RummyEngine:
         hand_size: int,
         seed: int,
         *,
-        opening_points: int = 30,
+        decks: int = 1,
+        opening_points: int = 0,
         max_turns: int = 200,
         first_player: int | None = None,
     ) -> None:
         if not 2 <= num_players <= MAX_PLAYERS:
             raise ValueError("Rummy needs 2-4 players.")
-        if num_players * hand_size + 2 > NUM_CARDS * COPIES:
+        if not 1 <= decks <= MAX_DECKS:
+            raise ValueError("Rummy uses one or two decks.")
+        if num_players * hand_size + 2 > NUM_CARDS * decks:
             raise ValueError("Not enough cards for this deal.")
         rng = random.Random(seed)
-        deck = full_deck()
+        deck = full_deck(decks)
         rng.shuffle(deck)
         self.num_players = num_players
         self.hand_size = hand_size
+        self.decks = decks
         self.opening_points = opening_points
         self.max_turns = max_turns
         self.hands = np.zeros((num_players, NUM_CARDS), dtype=np.int64)
@@ -145,22 +179,23 @@ class RummyEngine:
             for _ in range(hand_size):
                 self.hands[seat, deck.pop()] += 1
         self.known = np.zeros((num_players, NUM_CARDS), dtype=np.int64)
-        self.pile = [deck.pop()]
+        self.pile = [deck.pop()]  # bottom first; the top is the last
         self.pile_counts = np.zeros(NUM_CARDS, dtype=np.int64)
         self.pile_counts[self.pile[0]] += 1
         self.stock = deck  # drawn from the end
         self.table: list[int] = []
         self.table_counts = np.zeros(NUM_CARDS, dtype=np.int64)
+        self.placed = np.zeros((num_players, NUM_CARDS), dtype=np.int64)  # tabled copies per seat
+        self.points = np.zeros(num_players, dtype=np.int64)  # points melded and laid off
         self.layable = np.zeros(NUM_CARDS, dtype=bool)
-        self.opened = [False] * num_players
+        self.opened = [opening_points <= 0] * num_players
         self.current = rng.randrange(num_players) if first_player is None else first_player
         self.phase = DRAW
         self.turns = 0  # completed turns
         self.turn_points = 0  # opening points laid this turn by an unopened seat
-        self._turn_start_table_empty = True
-        self._turn_start_opened = False
+        self.obligation = NO_CARD  # a card taken from below the top, still to be used this turn
+        self.kept = NO_CARD  # the discard top taken this turn: it may be used or kept, not discarded
         self.winner: int | None = None
-        self.rummy = False
         self.truncated = False
         self._stock_out = False
         self._candidates: list[Action] | None = None
@@ -185,40 +220,115 @@ class RummyEngine:
 
         if self._candidates is None:
             if self.phase == DRAW:
-                self._candidates = [Action(STOCK)] + ([Action(TAKE, self.top)] if self.pile else [])
+                self._candidates = self._draw_candidates()
             elif self.phase == PLAY:
-                self._candidates = self._play_candidates()
+                actions = self._play_candidates(self.current, self.hands[self.current])
+                card = self.obligation
+                if card != NO_CARD:
+                    chains = self._chains(self.hands[self.current], card)
+                    actions = [
+                        action for action in actions
+                        if self._uses(action, card) or (action.kind == LAYOFF_RUN and (action.meld, action.card) in chains)
+                    ]
+                self._candidates = actions
             else:
                 self._candidates = []
         return self._candidates
 
-    def _play_candidates(self) -> list[Action]:
+    def _draw_candidates(self) -> list[Action]:
+        actions = [Action(STOCK)]
+        if not self.pile:
+            return actions
         seat = self.current
-        hand = self.hands[seat]
+        hand = self.hands[seat].copy()
+        # The taken top cannot go back this turn, so another card must be there to discard.
+        if hand.sum() > hand[self.pile[-1]]:
+            actions.append(Action(TAKE, self.pile[-1], 0))
+        hand[self.pile[-1]] += 1
+        for above in range(1, len(self.pile)):
+            card = self.pile[-1 - above]
+            hand[card] += 1
+            if self._usable(seat, hand, card):
+                actions.append(Action(TAKE, card, above))
+        return actions
+
+    def _usable(self, seat: int, hand: np.ndarray, card: int) -> bool:
+        """Whether ``card`` can be melded or laid off this turn from ``hand`` (just drawn)."""
+
+        if self.opened[seat]:
+            return bool(self.layable[card]) or can_meld(hand, card) or bool(self._chains(hand, card))
+        melds = hand_melds(hand)
+        return any(card in MELD_CARDS[meld] for meld in opening_melds(hand, melds, self.opening_points))
+
+    def _chains(self, hand: np.ndarray, card: int) -> set[tuple[int, int]]:
+        """(table position, first card) of every lay-off chain that ends with ``card``.
+
+        A chain extends a table run of the card's suit one hand card at a time
+        until ``card`` fits its end (2-3-4 on the table, 5 in hand: lay off 5,
+        then 6). It must leave a card to discard and the run within 13 cards.
+        The run's direct extensions (no hand card between) are in ``layable``.
+        """
+
+        suit, rank = divmod(card, NUM_RANKS)
         size = int(hand.sum())
+        starts = set()
+        for position, index in enumerate(self.table):
+            meld = MELDS[index]
+            if meld.kind != RUN or meld.a != suit or meld.c == FULL_RUN:
+                continue
+            for step, end in ((1, meld.b + meld.c - 1), (-1, meld.b)):
+                between = (rank - end) * step % NUM_RANKS - 1  # hand cards needed before ``card``
+                if between < 1 or meld.c + between + 1 > FULL_RUN or between + 1 >= size:
+                    continue
+                if all(hand[card_id(suit, (end + step * i) % NUM_RANKS)] for i in range(1, between + 1)):
+                    starts.add((position, card_id(suit, (end + step) % NUM_RANKS)))
+        return starts
+
+    @staticmethod
+    def _uses(action: Action, card: int) -> bool:
+        if action.kind in (MELD_GROUP, MELD_RUN):
+            return card in MELD_CARDS[action.meld]
+        return action.kind in (LAYOFF_GROUP, LAYOFF_RUN) and action.card == card
+
+    def _play_candidates(self, seat: int, hand: np.ndarray) -> list[Action]:
+        size = int(hand.sum())
+        kept = self.kept
+        # Cards that may be discarded: the turn must always be able to end.
+        spare = size - (int(hand[kept]) if kept != NO_CARD else 0)
+
+        def leaves_discard(cards) -> bool:
+            if kept == NO_CARD:
+                return len(cards) < spare
+            return spare - sum(card != kept for card in cards) >= 1
+
         melds = hand_melds(hand)
         actions: list[Action] = []
         if not self.opened[seat]:
             need = self.opening_points - self.turn_points
             for meld in opening_melds(hand, melds, need):
-                actions.append(Action(MELD_RUN if MELD_KIND[meld] else MELD_GROUP, NO_CARD, meld))
+                if leaves_discard(MELD_CARDS[meld]):
+                    actions.append(Action(MELD_RUN if MELD_KIND[meld] else MELD_GROUP, NO_CARD, meld))
             if self.turn_points:
                 return actions  # an opening in progress must be completed
         else:
+            # Opened seats meld three cards at a time and add the rest one lay-off at a
+            # time: 4-5-6 then 7 is the only way to table 4-5-6-7, so every extra card
+            # is its own play-or-hold decision and no outcome has two routes.
             for meld in melds:
-                if len(MELD_CARDS[meld]) < size:
+                if len(MELD_CARDS[meld]) == 3 and len(MELD_CARDS[meld]) < size and leaves_discard(MELD_CARDS[meld]):
                     actions.append(Action(MELD_RUN if MELD_KIND[meld] else MELD_GROUP, NO_CARD, meld))
             if size >= 2:
                 seen: set[tuple[int, int]] = set()
                 for position, meld in enumerate(self.table):
                     for card, _ in EXTENSIONS[meld]:
                         # Identical table melds give identical outcomes.
-                        if hand[card] and (card, meld) not in seen:
+                        if hand[card] and (card, meld) not in seen and leaves_discard((card,)):
                             seen.add((card, meld))
                             kind = LAYOFF_GROUP if MELD_KIND[meld] == GROUP else LAYOFF_RUN
                             actions.append(Action(kind, card, position))
         for card in np.flatnonzero(hand):
-            actions.append(Action(DISCARD, int(card)))
+            if card != kept:
+                actions.append(Action(DISCARD, int(card)))
         return actions
 
     # -- transitions -------------------------------------------------------
@@ -232,48 +342,71 @@ class RummyEngine:
         if self.phase == DRAW:
             if kind == STOCK:
                 card = self.stock.pop()
+                self.hands[seat, card] += 1
                 event = Event(EVENT_STOCK, seat, card, -1, (card,))
                 self._stock_out = not self.stock
             elif kind == TAKE:
-                card = self.pile.pop()
-                self.pile_counts[card] -= 1
-                self.known[seat, card] += 1
-                event = Event(EVENT_TAKE, seat, card, -1, (card,))
+                above = action.meld
+                if not 0 <= above < len(self.pile) or self.pile[-1 - above] != action.card:
+                    raise ValueError(f"Action {action} does not match the discard pile.")
+                taken = tuple(reversed(self.pile[-1 - above :]))  # top first
+                del self.pile[-1 - above :]
+                for card in taken:
+                    self.pile_counts[card] -= 1
+                    self.known[seat, card] += 1
+                    self.hands[seat, card] += 1
+                if above:
+                    self.obligation = action.card
+                else:
+                    self.kept = action.card
+                event = Event(EVENT_TAKE, seat, action.card, -1, taken)
             else:
                 raise ValueError(f"Action {action} is not a draw.")
-            self.hands[seat, card] += 1
             self.phase = PLAY
             return event
         if kind in (MELD_GROUP, MELD_RUN):
             meld = action.meld
             cards = MELD_CARDS[meld]
             for card in cards:
-                self._remove(seat, card)
-                self.table_counts[card] += 1
+                self._table(seat, card)
             self.table.append(meld)
+            self.points[seat] += MELD_POINTS[meld]
             if not self.opened[seat]:
                 self.turn_points += MELD_POINTS[meld]
                 if self.turn_points >= self.opening_points:
                     self.opened[seat] = True
                     self.turn_points = 0
+            if self.obligation in cards:
+                self.obligation = NO_CARD
             self._refresh_layable()
             return Event(EVENT_MELD, seat, NO_CARD, meld, cards)
         if kind in (LAYOFF_GROUP, LAYOFF_RUN):
             target = self.table[action.meld]
             extended = dict(EXTENSIONS[target])[action.card]
-            self._remove(seat, action.card)
-            self.table_counts[action.card] += 1
+            self._table(seat, action.card)
             self.table[action.meld] = extended
+            self.points[seat] += MELD_POINTS[extended] - MELD_POINTS[target]
+            if self.obligation == action.card:
+                self.obligation = NO_CARD
             self._refresh_layable()
             return Event(EVENT_LAYOFF, seat, action.card, extended, (action.card,))
         if kind == DISCARD:
+            if self.obligation != NO_CARD:
+                raise ValueError("A card taken from below the top must be used before discarding.")
             card = action.card
+            if card == self.kept:
+                raise ValueError("The discard top taken this turn cannot be discarded the same turn.")
             self._remove(seat, card)
             self.pile.append(card)
             self.pile_counts[card] += 1
             self._end_turn(seat)
             return Event(EVENT_DISCARD, seat, card, -1, (card,))
         raise ValueError(f"Action {action} is not a play.")
+
+    def _table(self, seat: int, card: int) -> None:
+        self._remove(seat, card)
+        self.table_counts[card] += 1
+        self.placed[seat, card] += 1
 
     def _remove(self, seat: int, card: int) -> None:
         if self.hands[seat, card] <= 0:
@@ -292,7 +425,6 @@ class RummyEngine:
     def _end_turn(self, seat: int) -> None:
         if not self.hands[seat].any():
             self.winner = seat
-            self.rummy = not self._turn_start_opened and self._turn_start_table_empty
             self.phase = DONE
             return
         self.turns += 1
@@ -306,8 +438,7 @@ class RummyEngine:
         self.current = (seat + 1) % self.num_players
         self.phase = DRAW
         self.turn_points = 0
-        self._turn_start_table_empty = not self.table
-        self._turn_start_opened = self.opened[self.current]
+        self.kept = NO_CARD
 
     # -- outcome -----------------------------------------------------------
 
@@ -315,34 +446,39 @@ class RummyEngine:
         return np.array([hand_penalty(self.hands[seat]) for seat in range(self.num_players)], dtype=np.float64)
 
     def scores(self) -> np.ndarray:
-        penalties = self.penalties()
-        if self.winner is None:
-            return -penalties
-        factor = 2.0 if self.rummy else 1.0
-        scores = -factor * penalties
-        scores[self.winner] = factor * (penalties.sum() - penalties[self.winner])
-        return scores
+        """Points melded and laid off minus the hand left (final once the round is over)."""
+
+        return self.points.astype(np.float64) - self.penalties()
 
     # -- ledgers -------------------------------------------------------------
 
-    def location_counts(self) -> np.ndarray:
-        """Copies per (view, location, card type): views 0..P-1 are the seats, view P the oracle."""
+    def location_counts(self, seat: int | None = None) -> np.ndarray:
+        """Copies per (view, location, card type): views 0..P-1 are the seats, view P the oracle.
+
+        With ``seat``, only that seat's view and the oracle's: [2, locations, 52].
+        """
 
         players = self.num_players
-        counts = np.zeros((players + 1, NUM_LOCATIONS, NUM_CARDS), dtype=np.int64)
-        counts[:, LOC_TABLE] = self.table_counts
-        counts[:, LOC_PILE] = self.pile_counts
+        seats = np.arange(players) if seat is None else np.array([seat])
+        views = len(seats)
+        counts = np.zeros((views + 1, NUM_LOCATIONS, NUM_CARDS), dtype=np.int64)
         if self.pile:
-            counts[:, LOC_PILE, self.pile[-1]] -= 1
-            counts[:, LOC_TOP, self.pile[-1]] = 1
-        # Observer o, location 1 + j: seat o + j's hand (own) or known copies.
-        counts[:players, 1 : 1 + players] = self.known[self._observed]
-        counts[np.arange(players), 1] = self.hands
-        counts[players, 1 : 1 + players] = self.hands
+            depth = np.minimum(np.arange(len(self.pile))[::-1], PILE_DEPTHS - 1)
+            np.add.at(counts[0], (LOC_PILE + depth, np.asarray(self.pile)), 1)
+            counts[1:, LOC_PILE : LOC_PILE + PILE_DEPTHS] = counts[0, LOC_PILE : LOC_PILE + PILE_DEPTHS]
+        counts[:, LOC_ABSENT] = COPIES - self.decks
+        # Observer o, location 1 + j: seat o + j's hand (own) or known copies;
+        # LOC_TABLE + j: the copies seat o + j tabled.
+        observed = self._observed[seats]
+        counts[:views, 1 : 1 + players] = self.known[observed]
+        counts[:views, LOC_TABLE : LOC_TABLE + players] = self.placed[observed]
+        counts[views, LOC_TABLE : LOC_TABLE + players] = self.placed
+        counts[np.arange(views), 1] = self.hands[seats]
+        counts[views, 1 : 1 + players] = self.hands
         counts[:, LOC_UNSEEN] = COPIES - counts[:, 1:].sum(axis=1)
         return counts
 
-    def view_pairs(self) -> np.ndarray:
-        """Copy-location pair codes [P + 1, 52]: views 0..P-1 are the seats, view P the oracle."""
+    def view_pairs(self, seat: int | None = None) -> np.ndarray:
+        """Copy-location pair codes [P + 1, 52] (views as in :meth:`location_counts`)."""
 
-        return PAIR_OF_CODE[np.tensordot(LOCATION_WEIGHTS, self.location_counts(), axes=(0, 1))]
+        return pair_codes(self.location_counts(seat))

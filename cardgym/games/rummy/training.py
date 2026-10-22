@@ -1,15 +1,16 @@
 """Rummy training streams, labels, and auxiliary objectives.
 
-Each seat has an actor stream and an oracle (critic) stream with one token per
-own decision, so a decision's actor position is also its critic position and
-every position is a decision. Auxiliaries are dense over every position:
+Each seat has an actor stream and an oracle (critic) stream with the same
+positions (its decision tokens and its opponents' turn tokens), so a
+decision's actor position is also its critic position. Auxiliaries:
 
-* ``hands`` (actor): copies (0/1/2) of every card type in every opponent's
-  hand, supervised only where the viewer cannot already know the answer
-  (some copy of the type is unseen). This is the belief state the trunk must
-  build from pickups, passes, and discards;
-* ``winner`` (actor and critic): who goes out, or nobody;
-* ``penalty`` (actor and critic): each seat's final hand value / 100.
+* ``hands`` (actor, decision tokens): copies (0/1/2) of every card type in
+  every opponent's hand, supervised only where the viewer cannot already know
+  the answer (some copy of the type is unseen). This is the belief state the
+  trunk must build from pickups, passes, and discards;
+* ``winner`` (actor and critic, every position): who goes out, or nobody;
+* ``penalty`` (actor and critic, every position): each seat's final hand
+  value / 100.
 """
 
 from __future__ import annotations
@@ -26,10 +27,10 @@ from cardgym.rl.selfplay import Trajectory
 from cardgym.rl.trainer import DenseRows, Totals
 
 from .cards import NUM_CARDS
-from .engine import LOC_UNSEEN, MAX_PLAYERS, NUM_PAIRS, PAIR_LOCATIONS
+from .engine import DISCARD, LOC_UNSEEN, MAX_PLAYERS, NUM_PAIRS, PAIR_LOCATIONS
 from .model import COUNT_CLASSES, NO_WINNER, OPPONENTS
 from .selfplay import RummySelfPlay
-from .tokens import F_PHASE, LEDGER_START
+from .tokens import CARD_START, F_KIND, F_PHASE, KIND_DECISION
 
 IGNORE = -1
 PENALTY_SCALE = 100.0
@@ -78,8 +79,10 @@ def training_sequences(trajectory: Trajectory) -> GameSequences:
         oracle = np.stack(game.oracle[seat])
         hands = np.stack(game.hands[seat])  # [L, P, 52] true hands at each token
         if oracle.shape[0] != length or hands.shape[0] != length:
-            raise AssertionError("Actor and oracle streams must hold one token per own decision.")
-        unseen = UNSEEN_COPIES[stream[:, LEDGER_START:] % NUM_PAIRS] > 0  # [L, 52]
+            raise AssertionError("Actor and oracle streams must have the same positions.")
+        decision = stream[:, F_KIND] == KIND_DECISION
+        # Decision tokens' card codes are state codes (pair + NUM_PAIRS * layable).
+        unseen = (UNSEEN_COPIES[stream[:, CARD_START:] % NUM_PAIRS] > 0) & decision[:, None]  # [L, 52]
         beliefs = np.full((length, OPPONENTS, NUM_CARDS), IGNORE, dtype=np.int8)
         for offset in range(1, players):
             opponent = hands[:, (seat + offset) % players]
@@ -94,7 +97,8 @@ def training_sequences(trajectory: Trajectory) -> GameSequences:
     critic_positions = []
     for decision in trajectory.decisions:
         phase = 0 if decision.head == "draw" else 1
-        if critic[decision.seat].tokens[decision.position, F_PHASE] != phase:
+        token = critic[decision.seat].tokens[decision.position]
+        if token[F_KIND] != KIND_DECISION or token[F_PHASE] != phase:
             raise AssertionError("Critic address is not tied to the acting seat's decision.")
         critic_positions.append(decision.position)
     return GameSequences(actor=actor, critic=critic, critic_positions=critic_positions)
@@ -124,6 +128,22 @@ def _penalty_terms(prediction: torch.Tensor, targets: torch.Tensor, players: tor
 
 
 class RummyHooks:
+    # Hold or play: at a play decision that could table a card (meld or lay-off)
+    # and could also end the turn, the binary split between ending it now (any
+    # discard: holding everything still playable) and tabling one more card.
+    # With three-card melds and single-card lay-offs (see the engine), playing
+    # some cards and holding the rest is a sequence of these splits. Its
+    # normalized entropy has its own target ([ppo] entropy_targets.hold).
+    gates = {"hold": "play"}
+
+    @staticmethod
+    def gate_side(gate: str, features: dict[str, torch.Tensor]) -> torch.Tensor:
+        """The candidates that hold: the discards."""
+
+        if gate != "hold":
+            raise ValueError(f"Unknown rummy gate {gate!r}.")
+        return features["kind"] == DISCARD
+
     def __init__(self, losses: RummyLossConfig, device: torch.device, precision: str) -> None:
         self.losses = losses
         self.device = device
@@ -141,18 +161,24 @@ class RummyHooks:
         weight = dense.weight
         total = torch.zeros((), device=device)
         players = _players(group, dense, rows, self.upload)
+        hands = None
+        if losses.hands > 0:
+            # Only decision tokens carry labels; a row without any adds nothing.
+            labels = group.labels["hands"][dense.start : dense.start + rows][dense.seq, dense.position]
+            keep = np.flatnonzero((labels != IGNORE).any(axis=(1, 2)))
+            at = self.upload(keep)
         with autocast_context(device, self.precision):
-            # Project the whole rectangle, then drop padding (faster on MPS).
-            hands = model.hands_head(flat)[dense.flat] if losses.hands > 0 else None
+            if losses.hands > 0:
+                hands = model.hands_head(flat[dense.flat[at]])
             winner = model.winner_head(flat)[dense.flat] if losses.winner > 0 else None
             penalty = model.penalty_head(flat)[dense.flat] if losses.penalty > 0 else None
         if hands is not None:
-            targets = _labels(group, "hands", dense, rows, self.upload, True).long()
-            logits = hands.float().view(len(dense), OPPONENTS, NUM_CARDS, COUNT_CLASSES)
+            targets = self.upload(labels[keep]).long()
+            logits = hands.float().view(keep.size, OPPONENTS, NUM_CARDS, COUNT_CLASSES)
             labeled = targets != IGNORE
             nll = F.cross_entropy(logits.permute(0, 3, 1, 2), targets.clamp_min(0), reduction="none")
             per_row = (nll * labeled).sum(dim=(1, 2)) / labeled.sum(dim=(1, 2)).clamp_min(1)
-            loss = (per_row * weight).sum()
+            loss = (per_row * weight[at]).sum()
             total = total + losses.hands * loss
             totals["hands_loss"].append(loss.detach())
             correct = (logits.argmax(-1) == targets) & labeled

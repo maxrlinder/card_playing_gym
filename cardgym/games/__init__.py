@@ -7,6 +7,7 @@ import importlib
 GAMES: dict[str, str] = {
     "plump": "cardgym.games.plump.game:PlumpGame",
     "rummy": "cardgym.games.rummy.game:RummyGame",
+    "piquet": "cardgym.games.piquet.game:PiquetGame",
 }
 
 

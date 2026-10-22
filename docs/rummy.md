@@ -2,24 +2,54 @@
 
 ## Rules
 
-Two 52-card decks without jokers (104 cards), 2-4 players, 13 cards each by
-default (`[game] hand_sizes`), cyclic runs, a 30-point opening. A turn is: draw
-from the stock or take the discard top, make any number of melds and
-lay-offs, discard. Discarding your last card wins: everyone else loses the
-value of their hand (Ace 11, faces 10, pips face value) and the winner gains
-the sum, doubled for going Rummy. Drawing the last stock card ends the round
-at the end of that turn; if nobody went out, everyone loses their hand value.
-The training reward is a seat's score minus the mean opponent score.
+Scandinavian rummy with 500 Rum's discard pile and scoring. One 52-card deck
+without jokers by default, two as an option (`[game] decks`); 2-4 players;
+seven cards each (`[game] hand_sizes`); cyclic runs; no opening requirement.
+A turn is:
 
-Interpretations (from `rummy-bot`'s `docs/rules.md`, kept as written):
+1. **Draw**: the stock's top card, or any card in the discard pile together
+   with every card above it. The top card alone may be kept or used, but
+   not discarded in the same turn. A deeper
+   card must be melded or laid off in the same turn (the cards above it go
+   to the hand), so it is offered only when that is possible: on a table
+   meld, in a meld from the hand, or at the end of a chain of lay-offs (with
+   2-3-4 on the table and a 5 in hand, a 6 deep in the pile can be taken:
+   lay off the 5, then the 6). Until it has been used the seat may only make
+   the melds and lay-offs that use it, or that start such a chain.
+2. **Meld and lay off**, any number, in any order, onto any meld on the
+   table. A meld is laid three cards at a time and grown by lay-offs (4-5-6,
+   then the 7), which scores the same as laying 4-5-6-7 at once.
+3. **Discard** one card. Discarding your last card goes out and ends the
+   round.
+
+Scoring (500 Rum): every card a seat melds or lays off scores its points for
+that seat; when the round ends, the cards left in each hand count against it
+(Ace 11, faces 10, pips face value). The round ends when someone goes out,
+or at the end of the turn that drew the last stock card. The training reward
+is a seat's score minus the mean opponent score.
+
+Interpretations:
 
 * a group is 3-4 cards of one rank in distinct suits, even with two decks;
 * a run is 3-13 cards of one suit on a contiguous arc of the rank cycle
   (`Q-K-A`, `K-A-2`); in runs an Ace is 1 when it starts the run and 11 when
-  a King precedes it (always 11 in a full 13-card run);
-* the opening may span several melds; a meld or lay-off never takes the last
-  card (you win by discarding it); `max_turns` bounds discard-take cycles and
-  scores like a stock-out.
+  a King precedes it (always 11 in a full 13-card run). A meld scores these
+  points; a lay-off scores what it adds to the meld;
+* a meld or lay-off never takes the last card (you go out by discarding it);
+* a top card taken from the pile cannot be discarded that turn; with two
+  decks neither can its other copy (the rule is on the card type). The top
+  is offered only if the hand holds another card type, and no meld or
+  lay-off may leave only that type, so the turn can always end. (Allowing
+  the throw-back, as `r7` did until iteration 1500, let self-play learn to
+  pass: take the top and discard it straight back on a third of all turns,
+  stalling a fifth of rounds into `max_turns`);
+* `max_turns` bounds a round and scores like a stock-out (reported as
+  `truncated`);
+* `[game] opening_points > 0` restores an opening threshold (melds in one
+  turn worth at least that much before a seat may lay off or discard).
+
+Training mixes every (players, decks, hand size) combination of the `[game]`
+lists, one rollout lane each: by default 2-4 players with one and two decks.
 
 `engine.py` implements this; `melds.py` enumerates the 589 valid melds once.
 
@@ -27,7 +57,7 @@ Interpretations (from `rummy-bot`'s `docs/rules.md`, kept as written):
 
 A Rummy decision depends on three things:
 
-1. **the viewer's own hand**: up to 14 cards, changing every turn by draws,
+1. **the viewer's own hand**: a handful of cards, changing every turn by draws,
    melds, lay-offs, and discards;
 2. **the public table**: the melds, the discard pile and its top, hand sizes,
    who has opened;
@@ -62,53 +92,69 @@ Two misconceptions are worth stating:
   the sum of a multiset is injective (any card count is a linear readout once
   `d >= 52`). Rummy goes further: each card type is its own categorical field.
 
-## Tokens: one token per own decision
+## Tokens: own decisions and opponent turns
 
-A seat's stream holds exactly one token per decision that seat makes: the
-observation it decides from.
+A seat's stream interleaves two kinds of token, in table order:
 
 ```text
-seat 0:  [obs before decision 1] [obs before decision 2] ...
+seat 0:  [decide: draw] [decide: meld] [decide: discard] [turn: opp 1] [turn: opp 2] [decide: draw] ...
 ```
 
-Opponents' turns are never tokens of their own in it. A token states the
-present and summarizes everything since the seat's previous token:
+Each token is a row of categorical fields plus 52 per-card codes, one per
+card type (`tokens.py`).
 
-* event fields (`tokens.py`): the decision phase (draw or play), the seat's
-  own previous action (kind, card, meld kind and size), per opponent whether
-  it drew from the stock or took the discard top since then (and which card
-  it took) and what it discarded, stock size, the four hand sizes, who has
-  opened, opening points laid this turn, players, round;
-* the **ledger**: 52 codes, one per card type: the locations of its two
-  copies as an unordered pair over 8 locations (36 codes), times who moved the
-  card type since the seat's previous token (nobody, the seat itself, or
-  opponent 1-3), times whether a copy can be laid off on the table: 360
-  codes. The seat's locations are: unseen, its hand, each opponent's publicly
-  known holdings (cards it took from the discard pile and has not played
-  since), table, discard pile, discard top.
+* **Decision tokens**, one right before each decision the seat makes, are
+  the readout positions. Their card codes are the explicit state: the
+  locations of each card type's two copies as an unordered pair over 11
+  locations, times whether a copy can be laid off on the table (462 codes).
+  The locations are: unseen, the seat's hand, each opponent's publicly known
+  holdings (cards it took from the discard pile and has not played since),
+  the table split by who put each copy there (the seat or opponent 1-3), the
+  discard pile by depth (0 is the top, 1-9 exactly, then "10 or deeper"),
+  and "not in this game" (the second copy with one deck). The fields add the
+  phase (draw or play), the seat's own previous action (kind, card, meld kind
+  and size), a card it took from below the top and must still use, and the
+  opening points laid this turn (when a threshold is set).
+* **Turn tokens**, one per completed opponent turn, carry what that opponent
+  did: who it was, whether it drew from the stock, took the discard top, or
+  dug deeper (the deepest card and how many cards it took), what it
+  discarded, how many melds and lay-offs it made, and per card type what the
+  turn did with it (copies taken, melded, laid off, discarded: 108 codes
+  after the state codes).
 
-So a game costs `decisions + seats` actor positions, not `seats x events`
-(3.5x fewer at three players), streams are tens of tokens (the longest
-possible is `2 * ceil(max_turns / 2) + 104`), every position is a decision,
-and the KV cache only grows for the seat that acts. What is given up is the
-order of an opponent's melds within its turn, which the policy has no use for.
+Both kinds carry the public counters: stock and pile sizes, the four hand
+sizes, who has opened, players, decks, round. Every stream is observer-relative.
 
-The ledger is exactly the viewer's knowledge: a test rebuilds it, and the
-mover codes and opponent fields, from the events the viewer saw
+So the stream is the round as the seat saw it: every opponent's every turn is
+its own position, in order, with its cards attributed (the "tells"), and
+every decision restates the present exactly, so the trunk need not rebuild
+the hand or the table from history. Order within an opponent's turn is the
+rules' (draw, melds and lay-offs, discard); the order of its melds within the
+turn is not kept, which the policy has no use for.
+
+A game costs `decisions + opponent turns` positions per seat: about 40
+tokens per stream (1.8x the earlier one token per own decision, which folded
+up to three opponents' turns into each token), not `events` per seat. The
+longest possible stream is `2 * ceil(max_turns / 2) + 104 + max_turns`.
+
+Decision tokens are exactly the viewer's knowledge and turn tokens exactly
+the public record: a test rebuilds both from the events the viewer saw
 (`tests/rummy/test_rummy_streams.py`).
 
 The critic reads a per-seat **oracle** stream with the same positions and
 layout, except that location `1 + j` is seat `j`'s whole hand, "unseen" is
-the stock, stock draws show their card, and one more field shows the next
-stock card. Its value head is seat-relative like the actor's.
+the stock, stock draws show their card (in turn tokens too), and one more
+field shows the next stock card. Its value head is seat-relative like the
+actor's.
 
 ## The card grid
 
-`CardGrid` (`model.py`) turns a ledger into per-card features and a token
-summary. Rummy's rules are invariant to permuting suits and, because runs are
+`CardGrid` (`model.py`) turns a token's 52 card codes (a decision token's
+state, or a turn token's moves) into per-card features and a token summary.
+One embedding table holds both code ranges. Rummy's rules are invariant to permuting suits and, because runs are
 cyclic, to rotating ranks; only card points break the rank symmetry. So:
 
-* card type `c` starts as `code_embedding[ledger[c]] + rank_embedding[rank(c)]`
+* card type `c` starts as `code_embedding[code[c]] + rank_embedding[rank(c)]`
   (width 32);
 * each block mixes a circular convolution along the 13-rank cycle (runs: is
   the 6 in my hand next to a 5 and a 7, are the outs dead) with each rank's
@@ -133,20 +179,33 @@ forward and backward.
 
 The engine enumerates every legal action; the policy scores the list:
 
-* `draw` head: stock, or take the discard top;
-* `play` head: every distinct meld the hand can form, every distinct lay-off
-  (card, target meld), every distinct discard. Discarding ends the turn, so
-  "stop melding" needs no action of its own.
+* `draw` head: stock, the discard top, or each deeper discard whose card the
+  seat could then use (with every card above it);
+* `play` head: every distinct three-card meld the hand can form, every
+  distinct lay-off (card, target meld), every distinct discard. Discarding
+  ends the turn, so "stop melding" needs no action of its own.
 
-The opening is laid one meld at a time. A meld is legal only if the rest of
-the hand can still reach the threshold while keeping a card to discard
+One route per outcome. Without the three-card rule, 4-5-6-7 could be laid
+at once or as 4-5-6 and then the 7: two routes to one result, and a policy
+that always took the long meld never faced "table the 7 or hold it". With
+it, every card past the third is its own decision, and a turn that plays
+some cards and keeps others is a sequence of "table one more" or "stop".
+(Unopened seats under an opening threshold still see melds of every size;
+the threshold search counts them whole.)
+
+After a deeper pickup the play head offers only the melds and lay-offs that
+use the obligated card, and the lay-offs that start a chain toward it on a
+table run, until it is used. With an opening threshold, the
+opening is laid one meld at a time; a meld is legal only if the rest of the
+hand can still reach the threshold while keeping a card to discard
 (`melds.opening_melds`, an exact search), and until it does the seat may only
 continue melding. Copies of a card are interchangeable, so a discard is one
 candidate per card type and identical target melds are one candidate.
 
 `CandidateScorer` embeds a candidate as its kind, plus the sum of its cards
 (their grid features at the decision point, plus an identity row), plus for a
-lay-off the sum of the target meld's cards. It adds a projection of the
+lay-off the sum of the target meld's cards, plus for a pickup the sum of
+every card it takes from the pile. It adds a projection of the
 readout hidden state and scores the result with a small MLP (additive
 attention). The grid features are the ones the embedding computed for the
 readout token (`pop_context`), so the card-level view is exact even where the
@@ -156,16 +215,38 @@ token summary blurs, at no extra encoding.
 
 Rummy uses the shared pipeline ([architecture](architecture.md)): PPO with
 Monte Carlo advantages from the oracle critic, adaptive entropy floors per
-head, the auxiliary gradient budget, and an actor value probe. Every position
-is a decision row; its baseline is the critic's value at the same position of
-the seat's oracle stream. Every position is also supervised by the
-auxiliaries:
+head, the auxiliary gradient budget, and an actor value probe.
 
-* `hands` (actor): how many copies of each card type each opponent holds,
-  trained only where the viewer cannot already know (some copy unseen). This
-  is the belief state; `hands_held_recall` tracks it on cards actually held;
-* `winner` (actor and critic): who goes out, or nobody;
-* `penalty` (actor and critic): each seat's final hand value / 100.
+Hold or play. Self-play learned to table everything it could, every turn;
+holding melds back (no information for opponents, nothing for them to lay
+off on) never got explored. The `hold` gate (`RummyHooks.gates`) is the
+binary split, at every play decision that could table a card and could also
+end the turn, between ending it (P of all discards) and tabling one more card
+(P of all melds and lay-offs). Its entropy in bits, averaged over the batch,
+has its own adaptive floor (`entropy_targets.hold`). The play head's entropy
+then measures only the rest: by the chain rule a decision's entropy is the
+split's entropy plus the expected entropy within the chosen side, and
+`entropy_play` is the second part (each side normalized by its own size,
+weighted by its probability held constant), so `play` and `hold` never
+count the same uncertainty. The deep preset targets 0.05 for draw, play and
+hold. Logged: `entropy_hold`, `hold_probability` (the policy's P(hold) where
+the gate applies), `hold_rate` and `hold_rate_endgame` (sampled holds;
+endgame = an opponent down to two cards or fewer), `hold_eligible_fraction`.
+
+With the gate (r7, 16100 -> 20600) the policy came to hold about 40% of
+eligible decisions but about 10% in the endgame, mostly confidently (hold
+entropy at its floor with a small alpha), and the argmax policy at 20600
+beat 16200 by +4.4 +- 1.0 points per game. Every
+decision token is a decision row; its baseline is the critic's value at the
+same position of the seat's oracle stream. The auxiliaries:
+
+* `hands` (actor, decision tokens): how many copies of each card type each
+  opponent holds, trained only where the viewer cannot already know (some
+  copy unseen). This is the belief state; `hands_held_recall` tracks it on
+  cards actually held;
+* `winner` (actor and critic, every position): who goes out, or nobody;
+* `penalty` (actor and critic, every position): each seat's final hand
+  value / 100.
 
 Returns are relative points (score minus mean opponent score) and
 `value_reward_scale = 50`.
@@ -190,6 +271,12 @@ The heuristic (`heuristic.py`) takes a discard that makes a new meld, melds
 and lays off at once, and discards its least connected, highest-value card.
 
 ## Measured (M5 Pro, base preset)
+
+These measurements predate turn tokens and the Scandinavian rules (two
+decks, 13 cards, one token per own decision, ~21 per stream in trained
+play). Now heuristic rounds take ~50 decisions with ~30 tokens per stream,
+and the host costs ~50 us per decision (rules, tokens, candidates; draw
+candidates check every pile depth).
 
 At the untrained start (games of ~250 events, the slowest regime), 144 games
 per update:
@@ -245,6 +332,37 @@ Memory: trainer ~9.5 GB driver-allocated (12.9 GB peak), each rollout worker
 memory free alongside other applications; `cohorts = 2` inside each worker
 was slower (twice the waves, and each worker's host is already busy).
 
+### Scandinavian rules on the deep preset
+
+After the rules pivot (7 cards, deep pickups, turn tokens) untrained play is
+long: ~60 turns and ~160k positions per update (~57k decisions). On those
+batches, update alone:
+
+| | update |
+| --- | --- |
+| starting point | 5.65 s |
+| critic's first epoch is also the advantage baseline (no separate forward); hands head on decision rows only | 5.32 s |
+| candidate scorer: one scatter, bmm and GEMM for all card slots | 5.24 s |
+| card grid as fused tensor-op kernels (`metal_grid`), peak memory 14 -> 10 GB | **5.04 s** |
+
+Rollout, one process collecting all 432 games: 5.06 -> 4.16 s with the
+scorer as one Metal kernel per head (`metal_scorer`) and one upload per dtype
+per wave, -> 3.99 s with everything after attention in a decode layer as one
+kernel (`cardgym.nn.metal_decode`) and lane-parallel decode attention; host
+dispatch 1.08 -> 0.26 s per collection. The host engine (~45 us per decision)
+is now most of it, and the workers wait on the update.
+
+End to end (two workers): ~7.7 -> ~7.0 s per iteration at these lengths
+(48 -> 43 us per position); the update runs ~1.5 s slower than alone because
+the rollout's decode waves share the GPU.
+
+Kernel level: card grid forward at 26k positions 24 -> 11.5 ms, backward
+~50 -> ~48 ms (the per-block weight-gradient tensor ops are bound by register
+pressure); a decode step at 336 rows 2.70 -> 2.08 ms. Two levers measured
+and not taken: microbatches of 64k positions (4.87 s, but 14 GB peak), and
+larger decode tiles (each threadgroup streams the layer's weights; fewer
+threadgroups leave cores idle).
+
 The fused path agrees with the PyTorch path on everything but the policy
 gradient to 1e-4..1e-3. The policy gradient, a sum of advantage-weighted
 terms that mostly cancel, differs by 4% with clipping off and 16% with it on,
@@ -263,16 +381,18 @@ few hundred rows).
 ## Status and next steps
 
 The pipeline is complete and tested (`tests/rummy`: meld search against brute
-force, engine invariants, ledger privacy and mover codes against an
-independent replay, oracle streams, continuous rollout against full replay,
+force, engine invariants, decision-token state and turn-token records
+against an independent replay, oracle streams, continuous rollout against full replay,
 fused kernels against PyTorch, end-to-end CLI including asynchronous
 rollout). The first run on the earlier design (`r3`) reached -23 points per
 seat against the heuristic after 200 iterations. Everything about the recipe
 is a starting point:
 
-* **Schedule.** 432 games and two PPO epochs per update (`deep.toml`). The
-  update and the rollout now cost about the same.
-* **Size.** d_model 256, 12 layers (8 trained + 4 grown), head_dim 32 (GQA
+* **Schedule.** 1296 games and two PPO epochs per update (`deep.toml`;
+  432 until r7 iteration 14300, when gains had slowed to ~1 point per
+  2,600 iterations). Each epoch accumulates its ~6 microbatches into one
+  optimizer step, so memory stays at the 32k-position microbatch.
+* **Size.** d_model 256, 12 layers, head_dim 32 (GQA
   8/2), card grid 2 x 32 wide.
 * **Advantages.** Monte Carlo; GAE is the first variance lever.
 * **Lag.** Decoupled PPO if `policy_lag` starts to cost (see Training).
@@ -281,8 +401,10 @@ is a starting point:
 * **Symmetry.** Suit permutation is an exact symmetry of the rules; the grid
   respects it, the per-card summary and event-card rows do not. Random suit
   relabelling per game is free augmentation.
-* **Speed.** The policy and auxiliary heads are a sixth of the update (the
-  candidate scorer's ~30 small ops per call); a fused scorer kernel is the
-  next kernel work, then the card grid's forward tail (scalar FMAs). The
-  rollout is host-bound (~50 us of rules, tokens and candidates per decision,
-  plus ~8 ms of dispatch per wave) and shares the GPU with the update.
+* **Speed.** The update is the bound (~5 s alone at untrained lengths,
+  shorter as games shorten). What is left is mostly the trunk at MPS's GEMM
+  rate and the exact two-stream backward the auxiliary gradient budget
+  needs; next levers: one grid and field-lookup backward for both streams
+  (~0.2-0.3 s), a fused training scorer (~0.25 s), split-key decode
+  attention. The rollout's host engine (~45 us per decision) matters only
+  once the update is faster than it.

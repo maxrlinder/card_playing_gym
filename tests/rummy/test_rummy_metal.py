@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 from cardgym.games.rummy.game import RummyGame, RummyGameConfig
 from cardgym.games.rummy.model import RummyModelConfig
-from cardgym.games.rummy.tokens import FIELD_VOCAB, LEDGER_VOCAB
+from cardgym.games.rummy.tokens import CARD_VOCAB, FIELD_VOCAB
 from cardgym.games.rummy.training import RummyLossConfig
 from cardgym.nn.metal_trunk import DualTrunkPass, MetalTrunk, trunk_parameters, unsupported_reason
 from cardgym.nn.packing import Packing
@@ -28,14 +28,14 @@ def rummy_game(**model) -> RummyGame:
     fields = dict(d_model=256, n_layers=2, n_heads=8, n_kv_heads=2, d_ff=512, per_layer_dim=64,
                   ledger_width=16, ledger_hidden=32, ledger_layers=1, score_dim=32)
     fields.update(model)
-    settings = RummyGameConfig(player_counts=(2, 3, 4), hand_sizes=(13,), games_per_shape=4, max_turns=200)
+    settings = RummyGameConfig(player_counts=(2, 3, 4), hand_sizes=(7,), games_per_shape=4, max_turns=200)
     return RummyGame(RummyModelConfig(**fields), settings, RummyLossConfig())
 
 
 def random_tokens(batch: int, length: int, seed: int = 0) -> torch.Tensor:
     generator = torch.Generator().manual_seed(seed)
     columns = [torch.randint(0, vocab, (batch, length, 1), generator=generator) for vocab in FIELD_VOCAB]
-    columns.append(torch.randint(0, LEDGER_VOCAB, (batch, length, 52), generator=generator))
+    columns.append(torch.randint(0, CARD_VOCAB, (batch, length, 52), generator=generator))
     return torch.cat(columns, dim=-1).to(DEVICE)
 
 
@@ -129,6 +129,7 @@ def test_fused_gathered_decode_matches_full_replay():
     )
     trajectories = collector.collect(game.lanes(1.0), random.Random(0), version=0)
     actor.trunk.metal = None
+    actor.scorer.fused = False
     worst = []
     with torch.no_grad():
         for trajectory in trajectories[:6]:
@@ -261,3 +262,66 @@ def test_fused_field_lookups_match_embedding_bag():
     want_grads = torch.autograd.grad(sum((o * p).sum() for o, p in zip(reference, probes)), tables)
     for got, want in zip(fused_grads, want_grads):
         assert relative(got, want) < 1e-2  # the output gradient is rounded to bf16
+
+
+@pytest.mark.parametrize("draw", [False, True])
+def test_fused_scorer_matches_pytorch(draw):
+    """The rollout's one-kernel candidate scorer gives the module's logits."""
+
+    from cardgym.games.rummy.cards import NO_CARD, NUM_CARDS
+    from cardgym.games.rummy.engine import NUM_ACTION_KINDS
+    from cardgym.games.rummy.model import CandidateScorer
+    from cardgym.games.rummy.selfplay import MAX_MELD_CARDS
+
+    torch.manual_seed(0)
+    rows, width = 37, 11
+    scorer = CandidateScorer(256, 32, 64).to(DEVICE).eval()
+    with torch.no_grad():
+        for p in scorer.parameters():
+            p.add_(0.05 * torch.randn_like(p))
+    hidden = torch.randn(rows, 256, device=DEVICE)
+    grid = torch.randn(rows, NUM_CARDS, 32, device=DEVICE).to(torch.bfloat16)
+    kind = torch.randint(0, NUM_ACTION_KINDS, (rows, width), dtype=torch.int8, device=DEVICE)
+    cards = torch.randint(0, NUM_CARDS + 1, (rows, width, MAX_MELD_CARDS), dtype=torch.int8, device=DEVICE)
+    target = torch.randint(0, NUM_CARDS + 1, (rows, width, MAX_MELD_CARDS), dtype=torch.int8, device=DEVICE)
+    cards[..., 3:] = NO_CARD
+    taken = torch.randint(0, 3, (rows, width, NUM_CARDS), dtype=torch.int8, device=DEVICE) if draw else None
+    with torch.no_grad():
+        exact = scorer(hidden, grid.float(), kind, cards, target, taken)
+        scorer.fused = True
+        fused = scorer(hidden, grid, kind, cards, target, taken)
+        scorer.fused = False
+    assert fused.shape == exact.shape
+    assert (fused - exact).abs().max().item() < 1e-3 * max(1.0, exact.abs().max().item())
+
+
+def test_fused_decode_layers_match_the_unfused_decode():
+    """Everything after attention as one tensor-op kernel per layer gives the unfused decode's hidden states."""
+
+    from cardgym.nn.kv_cache import KVCache
+    from cardgym.nn.metal_decode import library
+
+    game = rummy_game()
+    actor = randomize(game.build_actor().eval(), seed=7, scale=0.05).to(DEVICE)
+    actor.enable_metal_trunk(game.max_length)
+    metal = actor.trunk.metal
+    config = actor.trunk_config
+    if library(config.d_model, config.d_ff, config.per_layer_dim) is None:
+        pytest.skip("no Metal 4 tensor ops")
+    rows, steps = 45, 3
+    tokens = random_tokens(rows, steps, seed=8)
+    positions = torch.randint(0, 30, (rows,), device=DEVICE)
+    outputs = []
+    for fused in (False, True):
+        cache = KVCache(n_layers=config.n_layers, kv_heads=config.n_kv_heads, head_dim=config.head_dim,
+                        capacity=rows, max_len=64, device=DEVICE, dtype=torch.float16)
+        torch.manual_seed(9)
+        for layer in range(config.n_layers):
+            cache.k[layer].normal_()
+            cache.v[layer].normal_()
+        metal.fused_decode = fused
+        with torch.no_grad(), torch.autocast("mps", dtype=torch.bfloat16):
+            x0, ple, values = actor.prepare(tokens)
+            outputs.append(metal.decode(x0, ple, values, cache, positions, actor.trunk).float())
+        actor.pop_context()
+    assert relative(outputs[1], outputs[0]) < 1e-2

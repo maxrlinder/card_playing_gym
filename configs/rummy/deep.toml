@@ -1,7 +1,8 @@
-# The base recipe at 12 layers and 3x the games per update (432), grown from a
-# trained 8-layer run rather than started from scratch:
-#   cardgym rummy grow r6 --from r5 --config configs/rummy/deep.toml --fresh 4,5,10,11
-#   CARDGYM_METAL_TRUNK=1 tools/train_supervised.sh rummy r6 configs/rummy/deep.toml
+# The base recipe at 12 layers and 9x the games per update (1296; 432 until r7 iteration 14300). r5 and r6
+# played the earlier rules (two decks, 13 cards, 30-point opening, going-out
+# scoring) with the earlier token layout (commit 0745b58) and cannot resume
+# here. Start fresh:
+#   CARDGYM_METAL_TRUNK=1 tools/train_supervised.sh rummy r7 configs/rummy/deep.toml
 
 [run]
 game = "rummy"
@@ -16,8 +17,10 @@ seed = 0
 kv_dtype = "fp16"
 # Keep every lane's games in flight and refill as they end: a collection costs
 # about quota * mean length / in_flight waves instead of the longest game.
+# A third of the 216-game quota in flight (72 per lane) keeps each worker's
+# KV cache at ~1 GB; the full quota in flight would add ~4 GB.
 mode = "continuous"
-concurrency = 1.0
+concurrency = 0.3333
 # Collect the next batch in separate processes during the update; policy lag
 # is ~2 versions. Collection is host-bound (~50 us of game rules and tokens per
 # decision), so two workers split it; a third adds GPU contention and memory.
@@ -44,6 +47,11 @@ lr_warmup_updates = 10
 clip_ratio = 0.2
 # From scratch, optimizer steps per hour are what limit early learning.
 epochs = 2
+# Two optimizer steps per epoch (648 games each, four per update) on the same
+# compute: from r7 iteration 28200, when one step per epoch moved the policy
+# only KL ~0.0065 per update (clip ~3%) and gains had slowed to ~0.2 points
+# per game per 1000 iterations.
+minibatches = 2
 max_grad_norm = 1.0
 advantage_estimator = "monte_carlo"
 critic_learning_rate = 3e-4
@@ -53,21 +61,35 @@ value_reward_scale = 50.0
 actor_value_coef = 0.2
 auxiliary_grad_fraction = 0.25
 entropy_mode = "adaptive"
-entropy_targets = { draw = 0.15, play = 0.15 }
-# One token per own decision: streams are tens of tokens, rarely past 128.
+# Floors in practice: while entropy sits above its target, alpha decays toward
+# its 1e-6 clamp. Adam steps log alpha once per epoch: about a factor e per 500
+# updates once settled, several times faster just after a target change.
+# hold: the binary split, at a play decision that could table a card and
+# could also end the turn, between ending it (holding) and tabling one more
+# card, in bits (r7: from iteration 16100). play then measures only the
+# choice within the chosen side (which meld or lay-off, which discard), so
+# the two never count the same uncertainty. All 0.05 from r7 iteration 20800
+# (draw 0.025, play 0.04 over the whole list, hold 0.15 before).
+entropy_targets = { draw = 0.05, play = 0.05, hold = 0.05 }
+# Own decisions plus opponent turns: streams are ~40 tokens, rarely past 128.
 # The fused trunk runs packed rows (real tokens only), so padding costs no
-# compute: wide buckets make one or two groups, and 32k real tokens hold a
-# whole update's ~27k in one microbatch per epoch.
+# compute: wide buckets make one or two groups. An update is ~150k real tokens
+# (1296 games), about six microbatches of up to 32k per epoch, accumulated
+# into the epoch's optimizer steps.
 microbatch_positions = 32768
 sequence_bucket_width = 64
 critic_sequence_bucket_width = 64
 min_group_sequences = 32
 
 [game]
+# Every (players, decks, hand size) combination is a lane: an update mixes
+# 2-4 players with one and two decks, seven cards each.
 player_counts = [2, 3, 4]
-hand_sizes = [13]
-games_per_shape = 144
-opening_points = 30
+decks = [1, 2]
+hand_sizes = [7]
+# 216 x 6 lanes = 1296 games per update (432 until iteration 14300).
+games_per_shape = 216
+opening_points = 0
 max_turns = 200
 
 [losses]

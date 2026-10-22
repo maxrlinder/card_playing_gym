@@ -82,6 +82,10 @@ class PPOConfig:
     lr_decay_end_iteration: int = 0
     lr_decay_final_scale: float = 1.0
     epochs: int = 1
+    # Actor optimizer steps per epoch: each takes an equal slice of every
+    # sequence group (sequences are in collection order, so each slice is a
+    # sample of the batch's games and lanes). Same compute, more steps.
+    minibatches: int = 1
     max_grad_norm: float = 1.0
 
     # --- policy objective ---
@@ -93,15 +97,34 @@ class PPOConfig:
     # gradient's norm before the shared clip (0 = sum the losses as-is).
     # Adam is invariant to a uniform rescale, so only the ratio matters.
     auxiliary_grad_fraction: float = 0.0
+    # Measure that rescale (the two gradients separately: a second backward
+    # stream) every N actor steps; the steps between run one backward of
+    # policy + scale * auxiliary with the last measured scale. 1 measures
+    # every step (exact); the scale moves slowly, and a measured step costs
+    # about 1.7x a single one.
+    auxiliary_grad_refresh: int = 1
+    # The first N actor optimizer steps of a run (counted from zero after
+    # --init-from) train only the auxiliary losses and the value head, with
+    # the policy loss left out: a fine-tune onto a new objective (Piquet
+    # parties after single deals) first learns what the new returns are
+    # worth before advantages built on them move the policy.
+    policy_warmup_steps: int = 0
 
     # --- values ---
     critic_learning_rate: float = 3e-4
     critic_epochs: int = 2
     # Value errors are divided by this before squaring.
     value_reward_scale: float = 5.0
-    # Weight of the actor's own per-seat value probe. It never feeds
-    # advantages; it measures what observer information can predict.
+    # Weight of the actor's own per-seat value probe. With a critic it never
+    # feeds advantages (it measures what observer information can predict);
+    # without one it is the baseline and this trains it.
     actor_value_coef: float = 0.0
+    # Without a critic, where the baseline's values come from: "value_pass"
+    # reads the value head over the batch before the update (current
+    # weights, one forward pass); "rollout" records it with each sampled
+    # decision (no extra pass; the weights are the sampling ones, as old as
+    # the policy lag).
+    actor_baseline: Literal["value_pass", "rollout"] = "value_pass"
 
     # --- entropy ---
     # adaptive: one temperature per policy head, raised below its target
@@ -123,6 +146,11 @@ class PPOConfig:
     # into one batch (0 = exact lengths). Causality makes this exact.
     sequence_bucket_width: int = 16
     critic_sequence_bucket_width: int = 32
+    # The allocator's cached blocks are returned after an update once the
+    # driver holds more than this many GB (0: 60% of the device's
+    # recommended working set). Lower trades a little reallocation per update
+    # for less memory pressure on a shared machine.
+    device_cache_gb: float = 0.0
     # Merge length buckets until each holds this many sequences (0 = off):
     # long streams otherwise leave groups of one or two sequences.
     min_group_sequences: int = 0
@@ -132,12 +160,18 @@ class PPOConfig:
             raise ValueError("[ppo] learning rates must be positive.")
         if self.epochs < 1 or self.critic_epochs < 1:
             raise ValueError("[ppo] epochs must be >= 1.")
+        if self.minibatches < 1:
+            raise ValueError("[ppo] minibatches must be >= 1.")
         if not 0.0 < self.clip_ratio < 1.0:
             raise ValueError("[ppo] clip_ratio must be in (0, 1).")
         if not 0.0 <= self.gae_lambda <= 1.0:
             raise ValueError("[ppo] gae_lambda must be in [0, 1].")
         if self.auxiliary_grad_fraction < 0:
             raise ValueError("[ppo] auxiliary_grad_fraction must be non-negative.")
+        if self.auxiliary_grad_refresh < 1:
+            raise ValueError("[ppo] auxiliary_grad_refresh must be at least 1.")
+        if self.policy_warmup_steps < 0:
+            raise ValueError("[ppo] policy_warmup_steps must be non-negative.")
         if self.lr_schedule == "linear" and (
             self.lr_decay_end_iteration <= self.lr_decay_start_iteration
         ):
@@ -147,6 +181,10 @@ class PPOConfig:
                 raise ValueError("[ppo] an entropy schedule needs end > start iteration.")
             if set(self.entropy_targets_end) != set(self.entropy_targets):
                 raise ValueError("[ppo] entropy_targets_end must name the same heads.")
+        if self.actor_baseline not in ("value_pass", "rollout"):
+            raise ValueError(f"Unknown [ppo] actor_baseline {self.actor_baseline!r}.")
+        if self.device_cache_gb < 0:
+            raise ValueError("[ppo] device_cache_gb must be non-negative.")
         if self.microbatch_positions < 1:
             raise ValueError("[ppo] microbatch_positions must be positive.")
 

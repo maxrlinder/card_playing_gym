@@ -1,11 +1,13 @@
 """Rummy actor and oracle critic on the shared trunk.
 
-Input. A token is its event fields (one packed lookup, as in plump) plus a
-summary of the viewer's ledger computed by :class:`CardGrid`:
+Input. A token is its fields (one packed lookup, as in plump) plus a summary
+of its 52 per-card codes computed by :class:`CardGrid`. On a decision token
+the codes are the viewer's state (where both copies are, who tabled them,
+layable); on an opponent's turn token, what that turn did with each card type
+(taken, melded, laid off, discarded). One grid reads both:
 
-* each card type starts as the embedding of its ledger code (where both
-  copies are, moved, layable) plus a rank embedding (points break the rank
-  symmetry the rules otherwise have);
+* each card type starts as the embedding of its code plus a rank embedding
+  (points break the rank symmetry the rules otherwise have);
 * grid blocks on the 4 x 13 suit-by-rank grid mix a circular convolution
   along the rank cycle (runs are cyclic) with each rank's mean over suits
   (groups). Both are equivariant to suit permutations and rank rotations, the
@@ -15,16 +17,16 @@ summary of the viewer's ledger computed by :class:`CardGrid`:
   keeps card identity (and therefore injectivity) rather than pooling it away.
 
 The grid runs once per token, before the trunk. It is the token's input, so a
-cached key never goes stale: each position keeps the ledger of its own moment.
+cached key never goes stale: each position keeps the cards of its own moment.
 
 Output. Both policy heads score the engine's candidate list. A candidate's
-embedding sums its kind, its moved cards and (for a lay-off) the target
-meld's cards, each card represented by its grid features at the decision
+embedding sums its kind, its moved cards, (for a lay-off) the target meld's
+cards, and (for a pickup) every card it takes from the pile, each represented by its grid features at the decision
 point plus an identity row. The readout hidden state is added and an MLP
 scores the result (additive attention), so the head sees card-level detail
-the pooled token summary may blur. Every token is a decision point, so the
-heads reuse the grid features the embedding just computed (``pop_context``)
-rather than encoding the ledger twice.
+the pooled token summary may blur. The heads read decision tokens and reuse
+the grid features the embedding just computed for them (``pop_context``)
+rather than encoding the state twice.
 """
 
 from __future__ import annotations
@@ -42,7 +44,7 @@ from cardgym.nn.trunk import TrunkConfig, ValueEmbeddingMode, init_weights
 from .cards import CARD_RANKS, NO_CARD, NUM_CARDS, NUM_RANKS, NUM_SUITS
 from .engine import MAX_PLAYERS, NUM_ACTION_KINDS
 from .selfplay import MAX_MELD_CARDS
-from .tokens import FIELD_VOCAB, LEDGER_START, LEDGER_VOCAB, NUM_FIELDS
+from .tokens import CARD_START, CARD_VOCAB, FIELD_VOCAB, NUM_FIELDS
 
 OPPONENTS = MAX_PLAYERS - 1
 COUNT_CLASSES = 3  # copies of a card type in one hand: 0, 1, 2
@@ -118,7 +120,9 @@ class GridBlock(nn.Module):
     block-circulant GEMM per suit row, built from the Conv1d weights each
     call, and the suit pooling and its broadcast back are [1, 4] and [4, 1]
     matmuls, which keeps their backward passes GEMMs too. Same function and
-    parameters as the direct form; 3.4x faster forward and backward.
+    parameters as the direct form; 3.4x faster forward and backward. Under
+    bf16 autocast on MPS the whole grid runs as fused kernels instead
+    (:mod:`cardgym.nn.metal_grid`).
     """
 
     def __init__(self, width: int, hidden: int, kernel: int) -> None:
@@ -137,10 +141,6 @@ class GridBlock(nn.Module):
         self.register_buffer("shifts", shifts, persistent=False)
         self.register_buffer("pool", torch.full((1, NUM_SUITS), 1.0 / NUM_SUITS), persistent=False)
         self.register_buffer("spread", torch.ones(NUM_SUITS, 1), persistent=False)
-        self._operands_key: tuple | None = None
-        self._operands: tuple[torch.Tensor, torch.Tensor] | None = None
-        self._projections_key: tuple | None = None
-        self._projections: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def circulant(self, weight: torch.Tensor | None = None) -> torch.Tensor:
         """The convolution as a [13 * width, 13 * hidden] matrix acting on one suit row."""
@@ -150,47 +150,6 @@ class GridBlock(nn.Module):
         return torch.einsum("kio,hwk->iwoh", self.shifts.to(weight.dtype), weight).reshape(
             NUM_RANKS * width, NUM_RANKS * hidden
         )
-
-    def gemm_operands(self, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
-        """(circulant [13 * width, 13 * hidden], bias repeated per rank) in ``dtype``, no autograd.
-
-        Cached until the weights change: an optimizer step or any in-place
-        write (fused MPS Adam does not bump version counters, hence the
-        global step count). Building them is a handful of ~0.2 ms MPS
-        dispatches, paid per rollout wave and microbatch otherwise.
-        """
-
-        from cardgym.nn.metal_trunk import optimizer_steps
-
-        weight, bias = self.along_rank.weight, self.along_rank.bias
-        key = (weight._version, bias._version, optimizer_steps(), weight.device, dtype)
-        if self._operands_key != key:
-            with torch.no_grad():
-                self._operands = (
-                    self.circulant(weight.detach()).to(dtype), bias.detach().to(dtype).repeat(NUM_RANKS)
-                )
-            self._operands_key = key
-        return self._operands
-
-    def projection_operands(self, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
-        """(across weight [hidden, width], out weight [width, hidden]) in ``dtype``, cached like gemm_operands."""
-
-        from cardgym.nn.metal_trunk import optimizer_steps
-
-        across, out = self.across_suits.weight, self.out.weight
-        key = (across._version, out._version, optimizer_steps(), across.device, dtype)
-        if self._projections_key != key:
-            with torch.no_grad():
-                self._projections = (across.detach().to(dtype), out.detach().to(dtype))
-            self._projections_key = key
-        return self._projections
-
-    def conv_grad(self, d_circulant: torch.Tensor) -> torch.Tensor:
-        """The Conv1d weight gradient [hidden, width, kernel] from the circulant's gradient."""
-
-        hidden, width, _ = self.along_rank.weight.shape
-        shaped = d_circulant.reshape(NUM_RANKS, width, NUM_RANKS, hidden)
-        return torch.einsum("kio,iwoh->hwk", self.shifts, shaped.float())
 
     def forward(self, grid: torch.Tensor) -> torch.Tensor:  # [N, suits, ranks, width]
         count, _, _, width = grid.shape
@@ -205,13 +164,13 @@ class GridBlock(nn.Module):
 
 
 class CardGrid(nn.Module):
-    """Ledger codes [..., 52] -> per-card features [..., 52, width] and a token summary [..., d]."""
+    """Card codes [..., 52] -> per-card features [..., 52, width] and a token summary [..., d]."""
 
     def __init__(self, config: RummyModelConfig) -> None:
         super().__init__()
         width = config.ledger_width
         self.width = width
-        self.code = nn.Embedding(LEDGER_VOCAB, width)
+        self.code = nn.Embedding(CARD_VOCAB, width)
         self.rank = nn.Embedding(NUM_RANKS, width)
         self.blocks = nn.ModuleList(
             GridBlock(width, config.ledger_hidden, config.ledger_kernel) for _ in range(config.ledger_layers)
@@ -220,9 +179,13 @@ class CardGrid(nn.Module):
         self.summary = nn.Linear(NUM_CARDS * width, config.d_model, bias=False)
         self.hidden = config.ledger_hidden
         self.eps = self.norm.eps
+        # The fused kernels' grid shape: 13 ranks on a cycle.
+        self.ranks, self.circular = NUM_RANKS, True
         # Fused Metal kernels (metal_grid) under MPS bf16 autocast; set by
         # enable_metal_trunk, like the trunk's.
         self.fused = False
+        self._fused_key: tuple | None = None
+        self._fused_operands: dict | None = None
         for module in (self.code, self.rank, *self.blocks):
             module.apply(init_weights)
         with torch.no_grad():
@@ -244,7 +207,7 @@ class CardGrid(nn.Module):
     def cards(self, ledger: torch.Tensor) -> torch.Tensor:
         lead = ledger.shape[:-1]
         if self.uses_fused(ledger.device):
-            from .metal_grid import FusedCardGrid
+            from cardgym.nn.metal_grid import FusedCardGrid
 
             params = [self.code.weight, self.rank.weight]
             for block in self.blocks:
@@ -273,7 +236,7 @@ def _bag(ids: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 
 class RummyEmbedding(nn.Module):
-    """Event fields plus the card-grid summary; optionally keeps the per-card features.
+    """Token fields plus the card-grid summary; optionally keeps the per-card features.
 
     With ``keep_cards`` the latest forward's per-card features [..., 52, w]
     stay available (once) for the policy heads.
@@ -301,7 +264,7 @@ class RummyEmbedding(nn.Module):
     def forward(self, tokens: torch.Tensor):
         tokens = tokens.long()
         ids = tokens[..., :NUM_FIELDS] + self.offsets
-        cards, summary = self.grid(tokens[..., LEDGER_START:])
+        cards, summary = self.grid(tokens[..., CARD_START:])
         if self.keep_cards:
             self.kept = cards
         tables = [self.fields.weight] + [
@@ -326,14 +289,6 @@ class RummyEmbedding(nn.Module):
         )
 
 
-def _multi_hot(cards: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """Copies of each card type named by ``cards`` [N, K, C] (NO_CARD counts nothing): [N, K, 52]."""
-
-    hot = torch.zeros(*cards.shape[:2], NUM_CARDS + 1, device=cards.device, dtype=dtype)
-    hot.scatter_add_(2, cards, torch.ones_like(cards, dtype=dtype))
-    return hot[..., :NUM_CARDS]
-
-
 class CandidateScorer(nn.Module):
     """Additive-attention score of each candidate action against the readout state."""
 
@@ -346,10 +301,18 @@ class CandidateScorer(nn.Module):
         self.target_id = nn.Embedding(NUM_CARDS, dim)
         self.kind = nn.Embedding(NUM_ACTION_KINDS, dim)
         self.size = nn.Embedding(MAX_MELD_CARDS + 1, dim)
+        # Draw candidates: every card a pickup takes from the discard pile.
+        self.taken = nn.Linear(card_width, dim, bias=False)
+        self.taken_id = nn.Embedding(NUM_CARDS, dim)
         self.norm = nn.LayerNorm(dim)
         self.hidden = nn.Linear(dim, dim)
         self.out = nn.Linear(dim, 1)
         self.apply(init_weights)
+        # Inference on MPS runs as one Metal kernel (metal_scorer); set by
+        # enable_metal_trunk. Training keeps this module's autograd path.
+        self.fused = False
+        self._fused_key: tuple | None = None
+        self._fused_weights: dict | None = None
 
     def forward(
         self,
@@ -358,20 +321,36 @@ class CandidateScorer(nn.Module):
         kind: torch.Tensor,
         cards: torch.Tensor,
         target: torch.Tensor,
+        taken: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        cards = cards.long()
-        target = target.long()
-        # Sum each candidate's cards first, then project: by linearity the
-        # same as projecting all 52 cards per row, at a fraction of the traffic.
-        moved = _multi_hot(cards, grid.dtype)
-        aimed = _multi_hot(target, grid.dtype)
+        if self.fused and hidden.device.type == "mps" and not torch.is_grad_enabled():
+            from .metal_scorer import score
+
+            return score(self, hidden, grid, kind, cards, target, taken)
+        rows, width = kind.shape
+        dtype = grid.dtype
+        slots = 2 if taken is None else 3
+        # Copies of each card type per slot (moved, lay-off target, taken):
+        # one scatter into [N, K, slots, 52]; NO_CARD entries add zero.
+        ids = torch.cat([cards, target], dim=-1).long()
+        present = ids != NO_CARD
+        offsets = torch.arange(2, device=ids.device).repeat_interleave(cards.shape[-1]) * NUM_CARDS
+        counts = torch.zeros(rows, width, slots * NUM_CARDS, device=ids.device, dtype=dtype)
+        counts.scatter_add_(2, torch.where(present, ids + offsets, 0), present.to(dtype))
+        if taken is not None:
+            counts[..., 2 * NUM_CARDS :] = taken.to(dtype)
+        # Sum each slot's card features first, then project: by linearity the
+        # same as projecting all 52 cards per row, at a fraction of the
+        # traffic. All slots go through one bmm and one GEMM each for the
+        # features and the identity rows.
+        summed = torch.bmm(counts.view(rows, width * slots, NUM_CARDS), grid).view(rows, width, -1)
+        projections = (self.card.weight, self.target.weight, self.taken.weight)[:slots]
+        identities = (self.card_id.weight, self.target_id.weight, self.taken_id.weight)[:slots]
         candidate = (
-            self.card(moved @ grid)
-            + moved @ self.card_id.weight.to(grid.dtype)
-            + self.target(aimed @ grid)
-            + aimed @ self.target_id.weight.to(grid.dtype)
+            F.linear(summed, torch.cat(projections, dim=1))
+            + counts @ torch.cat(identities).to(dtype)
             + self.kind(kind.long())
-            + self.size((cards != NO_CARD).sum(-1))
+            + self.size(present[..., : cards.shape[-1]].sum(-1))
         )
         mixed = self.norm(self.query(hidden)[:, None, :] + candidate)
         return self.out(F.gelu(self.hidden(mixed))).squeeze(-1)
@@ -401,6 +380,9 @@ class RummyActor(PolicyModel):
     def enable_metal_trunk(self, max_length: int | None = None) -> None:
         super().enable_metal_trunk(max_length)
         self.embedding.grid.fused = metal_grid_supported(self.config)
+        from .metal_scorer import supported
+
+        self.scorer.fused = supported(self.scorer)
 
     def pop_context(self) -> torch.Tensor | None:
         cards, self.embedding.kept = self.embedding.kept, None
@@ -411,17 +393,19 @@ class RummyActor(PolicyModel):
             raise ValueError("Rummy policy heads score candidate lists at a readout token.")
         if head not in self.policy_heads:
             raise ValueError(f"Unknown rummy policy head {head!r}.")
-        grid = self.embedding.grid.cards(tokens[..., LEDGER_START:]) if context is None else context
-        return self.scorer(hidden, grid, features["kind"], features["cards"], features["target"])
+        grid = self.embedding.grid.cards(tokens[..., CARD_START:]) if context is None else context
+        return self.scorer(
+            hidden, grid, features["kind"], features["cards"], features["target"], features.get("taken")
+        )
 
     def player_values(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.value_head(hidden)
 
 
 def metal_grid_supported(config: RummyModelConfig) -> bool:
-    from .metal_grid import supported
+    from cardgym.nn.metal_grid import supported
 
-    return config.ledger_layers > 0 and supported(config.ledger_width, config.ledger_hidden)
+    return config.ledger_layers > 0 and supported(config.ledger_width, config.ledger_hidden, config.ledger_kernel)
 
 
 class RummyCritic(CriticModel):

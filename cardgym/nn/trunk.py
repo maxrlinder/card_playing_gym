@@ -110,8 +110,9 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        rms = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).sqrt()
-        return (x.float() / rms).to(x.dtype) * self.weight
+        # One fused kernel (the op-by-op form is six launches per call, paid
+        # on every rollout wave); the same function up to fp32 rounding.
+        return F.rms_norm(x.float(), (x.shape[-1],), eps=self.eps).to(x.dtype) * self.weight
 
 
 class DecoderBlock(nn.Module):

@@ -8,9 +8,10 @@ index, so table melds, candidates, and lay-off transitions are small ints:
 * a **run** is 3-13 cards of one suit on a contiguous arc of the rank cycle,
   so ``Q-K-A`` and ``K-A-2`` are runs. All 13-card runs are one meld.
 
-Points (used only for the opening threshold): an Ace is 11 in groups and
-wherever a King precedes it in a run, and 1 when it starts a shorter run
-(``A-2-3``); a full 13-card run counts it 11.
+Points (what a meld scores for the seat that lays it, and the opening
+threshold when one is set): an Ace is 11 in groups and wherever a King
+precedes it in a run, and 1 when it starts a shorter run (``A-2-3``); a full
+13-card run counts it 11. A lay-off scores the difference it makes.
 """
 
 from __future__ import annotations
@@ -18,7 +19,9 @@ from __future__ import annotations
 from itertools import combinations
 from typing import NamedTuple
 
-from .cards import ACE, NUM_RANKS, NUM_SUITS, RANK_VALUES, card_id
+import numpy as np
+
+from .cards import ACE, NUM_CARDS, NUM_RANKS, NUM_SUITS, RANK_VALUES, card_id
 
 GROUP = 0
 RUN = 1
@@ -76,6 +79,33 @@ MELD_CARDS: list[tuple[int, ...]] = [_cards(meld) for meld in MELDS]
 MELD_POINTS: list[int] = [_points(meld) for meld in MELDS]
 MELD_KIND: list[int] = [meld.kind for meld in MELDS]
 NUM_MELDS = len(MELDS)
+MELD_COUNTS = np.zeros((NUM_MELDS, NUM_CARDS), dtype=np.int64)
+for _index, _meld_cards in enumerate(MELD_CARDS):
+    MELD_COUNTS[_index, list(_meld_cards)] = 1
+MELD_SIZE = MELD_COUNTS.sum(axis=1)
+# The melds that contain each card type.
+MELDS_WITH = [np.flatnonzero(MELD_COUNTS[:, card]) for card in range(NUM_CARDS)]
+
+
+def can_meld(counts, card: int) -> bool:
+    """Whether the hand (52 copy counts) forms a meld containing ``card`` that leaves a card to discard."""
+
+    if counts.sum() >= 4:
+        # Any meld has 3+ cards, so a group (two other suits of the rank) or a
+        # run (an arc of 3+ ranks through the card) is enough. Runs wrap.
+        suit, rank = divmod(card, NUM_RANKS)
+        if sum(1 for other in range(NUM_SUITS) if other != suit and counts[other * NUM_RANKS + rank]) >= 2:
+            return True
+        base = suit * NUM_RANKS
+        below = above = 0
+        while below < NUM_RANKS - 1 and counts[base + (rank - below - 1) % NUM_RANKS]:
+            below += 1
+        while above < NUM_RANKS - 1 - below and counts[base + (rank + above + 1) % NUM_RANKS]:
+            above += 1
+        return below + above >= 2
+    rows = MELDS_WITH[card]
+    fits = (MELD_COUNTS[rows] <= counts).all(axis=1) & (MELD_SIZE[rows] < counts.sum())
+    return bool(fits.any())
 
 
 def _extensions(meld: Meld) -> tuple[tuple[int, int], ...]:

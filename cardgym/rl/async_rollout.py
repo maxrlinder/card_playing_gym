@@ -63,7 +63,7 @@ def _serve(
         from cardgym.nn.metal_trunk import unsupported_reason
 
         from .continuous import ContinuousCollector, split_lanes
-        from .setup import resolve_config
+        from .setup import records_values, resolve_config
 
         config = resolve_config(raw_config)
         game = config.game
@@ -84,6 +84,7 @@ def _serve(
             kv_dtype=config.rollout.kv_dtype,
             max_length=game.max_length,
             cohorts=config.rollout.cohorts,
+            record_values=records_values(config),
         )
         rng = random.Random(seed)
         lanes = split_lanes(game.lanes(config.rollout.concurrency), worker, workers)

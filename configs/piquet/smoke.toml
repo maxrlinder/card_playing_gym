@@ -1,0 +1,46 @@
+# A seconds-long CPU run that exercises every part of the pipeline:
+#   cardgym piquet train smoke --config configs/piquet/smoke.toml
+
+[run]
+game = "piquet"
+iterations = 3
+checkpoint_every = 1
+device = "cpu"
+precision = "fp32"
+seed = 0
+
+[rollout]
+kv_dtype = "fp32"
+mode = "continuous"
+
+[model]
+d_model = 32
+n_layers = 2
+n_heads = 4
+n_kv_heads = 2
+d_ff = 64
+per_layer_dim = 8
+value_embeddings = "alternating"
+card_width = 8
+card_hidden = 16
+card_layers = 1
+score_dim = 16
+
+[ppo]
+learning_rate = 0.001
+lr_warmup_updates = 1
+clip_ratio = 0.2
+minibatches = 2
+value_reward_scale = 30.0
+actor_value_coef = 0.5
+actor_baseline = "rollout"
+auxiliary_grad_fraction = 0.25
+auxiliary_grad_refresh = 2
+entropy_targets = { exchange = 0.5, declare = 0.5, play = 0.5 }
+microbatch_positions = 4096
+
+[game]
+modes = ["deal", "rubicon"]
+games_per_mode = 3
+
+[losses]

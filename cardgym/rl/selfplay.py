@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
-from cardgym.core.devices import DTYPES, Fence, autocast_context, release_device_memory, to_device
+from cardgym.core.devices import DTYPES, Fence, autocast_context, release_device_memory, to_device, upload_packed
 
 from .ppo import masked_probabilities, sample_rows
 
@@ -98,6 +98,17 @@ class SelfPlayGame(abc.ABC):
 
         return 0
 
+    def context_starts(self) -> list[int | None] | None:
+        """Where a fresh context begins in the blocks the last ``step`` returned.
+
+        Per observer, the index into its block from which the policy forgets
+        everything before (a Piquet partie restarts each deal), or None to
+        continue. The stream keeps every token; decision positions count from
+        its start and the game's training sequences split it the same way.
+        """
+
+        return None
+
 
 @dataclass
 class DecisionRecord:
@@ -108,6 +119,9 @@ class DecisionRecord:
     probs: np.ndarray  # masked behavior policy, float32 [actions]
     features: dict[str, np.ndarray] | None = None
     version: int = 0  # the collector's policy version when sampled
+    # The actor's raw player_values at the readout (acting seat first), when
+    # the collector records them ([ppo] actor_baseline = "rollout").
+    value: np.ndarray | None = None
 
 
 @dataclass
@@ -146,6 +160,34 @@ class _Live:
     pending: Decision | None = None
     readout: np.ndarray | None = None  # the pending actor's last token
     logits: np.ndarray | None = None
+    value: np.ndarray | None = None
+    # Per observer, stream tokens before its current context (see context_starts).
+    offsets: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        if self.offsets is None:
+            self.offsets = np.zeros_like(self.lengths)
+
+
+def restart_contexts(state: _Live, blocks: list[np.ndarray]) -> list[np.ndarray]:
+    """Apply the game's context restarts after a step; returns the blocks to decode.
+
+    A restarted observer's cached length drops to zero: the new context is
+    written from position 0, and causal attention never reaches the stale
+    keys past it.
+    """
+
+    starts = state.game.context_starts()
+    if starts is None:
+        return blocks
+    decoded = list(blocks)
+    for seat, start in enumerate(starts):
+        if start is None:
+            continue
+        state.offsets[seat] += state.lengths[seat] + start
+        state.lengths[seat] = 0
+        decoded[seat] = blocks[seat][start:]
+    return decoded
 
 
 @dataclass
@@ -177,10 +219,12 @@ class SelfPlayCollector:
         max_rows: int,
         max_length: int,
         cohorts: int = 1,
+        record_values: bool = False,
     ) -> None:
         self.model = model
         self.device = device
         self.precision = precision
+        self.record_values = record_values
         self.kv_dtype = DTYPES[kv_dtype]
         self.max_rows = max_rows
         self.cohorts = max(1, cohorts)
@@ -280,7 +324,7 @@ class SelfPlayCollector:
             if state.game.done():
                 results[index] = self._finish(state)
             else:
-                appends.append((state, blocks))
+                appends.append((state, restart_contexts(state, blocks)))
                 survivors.append((index, state))
         t2 = time.perf_counter()
         self.stats.sample_sec += t1 - t0
@@ -415,7 +459,7 @@ class SelfPlayCollector:
         cohort.launched.extend(
             launch_policies(
                 self.model, self.device, self.precision, lambda array: self._upload(cohort, array),
-                hidden, states, None,
+                hidden, states, None, values=self.record_values,
             )
         )
 
@@ -426,10 +470,7 @@ class SelfPlayCollector:
         if cohort.fence is not None:
             cohort.fence.wait()
         self.stats.wait_sec += time.perf_counter() - started
-        for states, logits in cohort.launched:
-            values = logits.numpy()
-            for row, state in enumerate(states):
-                state.logits = values[row]
+        receive_launched(cohort.launched)
         cohort.launched = []
         cohort.keep = []
         cohort.fence = None
@@ -442,12 +483,14 @@ DECISION_BUCKET = 16
 CANDIDATE_BUCKET = 8
 
 
-def launch_policies(model, device, precision, upload, hidden, states, context):
-    """Queue each pending decision's head; returns [(states, logits on their way to the host)].
+def launch_policies(model, device, precision, upload, hidden, states, context, *, values: bool = False):
+    """Queue each pending decision's head; returns [(states, logits, values or None)] on their way to the host.
 
     ``hidden`` [N, d] and ``context`` (None or [N, ...]) are the states'
     readouts in order. Reads are padded to bucketed decision and candidate
     counts (MPS compiles a graph per shape) by repeating the first decision.
+    With ``values`` the actor's ``player_values`` at the same readouts come
+    along (the rollout-recorded baseline).
     """
 
     by_head: dict[str, list[int]] = {}
@@ -457,16 +500,33 @@ def launch_policies(model, device, precision, upload, hidden, states, context):
     with autocast_context(device, precision):
         for head, positions in by_head.items():
             padded = positions + [positions[0]] * (_round_up(len(positions), DECISION_BUCKET) - len(positions))
-            features = _stack_features([states[p].pending.features for p in padded], CANDIDATE_BUCKET)
-            if features is not None:
-                features = {key: upload(value) for key, value in features.items()}
-            index = upload(np.asarray(padded, dtype=np.int64))
-            tokens = upload(np.stack([states[p].readout for p in padded]).astype(np.int64))
+            features = _stack_features([states[p].pending.features for p in padded], CANDIDATE_BUCKET) or {}
+            # Readout tokens only matter to a head without the embedding's context.
+            extra = [] if context is not None else [np.stack([states[p].readout for p in padded]).astype(np.int64)]
+            index, *uploaded = upload_packed(upload, [np.asarray(padded, dtype=np.int64), *features.values(), *extra])
+            tokens = uploaded.pop() if extra else None
+            features = dict(zip(features, uploaded)) or None
             logits = model.policy_logits(
                 hidden[index], head, features, tokens, None if context is None else context[index]
             )
-            launched.append(([states[p] for p in positions], logits.float().to("cpu", non_blocking=True)))
+            seat_values = (
+                model.player_values(hidden[index]).float().to("cpu", non_blocking=True) if values else None
+            )
+            launched.append(
+                ([states[p] for p in positions], logits.float().to("cpu", non_blocking=True), seat_values)
+            )
     return launched
+
+
+def receive_launched(launched) -> None:
+    """Hand each state its logits (and recorded values) once the launch's fence has passed."""
+
+    for states, logits, seat_values in launched:
+        rows = logits.numpy()
+        recorded = None if seat_values is None else seat_values.numpy()
+        for row, state in enumerate(states):
+            state.logits = rows[row]
+            state.value = None if recorded is None else recorded[row].copy()
 
 
 def sample_decisions(states, version: int = 0) -> int:
@@ -493,15 +553,17 @@ def sample_decisions(states, version: int = 0) -> int:
                 DecisionRecord(
                     seat=decision.seat,
                     head=head,
-                    position=int(state.lengths[decision.seat]) - 1,
+                    position=int(state.offsets[decision.seat] + state.lengths[decision.seat]) - 1,
                     action=int(sampled[row]),
                     probs=probs[row, :actions].astype(np.float32),
                     features=decision.features,
                     version=version,
+                    value=state.value,
                 )
             )
             state.pending = None
             state.logits = None
+            state.value = None
     return len(states)
 
 

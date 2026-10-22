@@ -85,12 +85,15 @@ def add_train_arguments(parser: argparse.ArgumentParser) -> None:
 
 def default_panels(heads: tuple[str, ...]) -> list[Panel]:
     return [
+        # One color per head: entropy (solid), its target (dashed), its alpha
+        # (dotted). Log scale: a lowered target walks alpha down by orders of magnitude.
         Panel(
-            "Policy entropy (normalized)",
-            tuple(f"entropy_{h}" for h in heads) + tuple(f"entropy_target_{h}" for h in heads),
+            "Entropy (solid), target (dashed), alpha (dotted)",
+            tuple(f"{kind}_{h}" for h in heads for kind in ("entropy", "entropy_target", "entropy_alpha")),
+            log=True,
+            styles=tuple((i, style) for i in range(len(heads)) for style in ("-", "--", ":")),
         ),
-        Panel("Entropy temperatures", tuple(f"entropy_alpha_{h}" for h in heads)),
-        Panel("PPO", ("clip_fraction", "behavior_kl")),
+        Panel("PPO", ("clip_fraction", "behavior_kl"), top=0.1),
         Panel("Losses", ("loss_policy", "loss_critic_value", "actor_value_loss")),
         Panel(
             "Value error (reward units)",
@@ -98,10 +101,16 @@ def default_panels(heads: tuple[str, ...]) -> list[Panel]:
         ),
         Panel("Value correlation", ("value_correlation", "critic_dense_correlation")),
         Panel(
-            "Gradient norms",
+            "Gradient norms (before clipping)",
             ("actor_grad_norm", "policy_grad_norm", "auxiliary_grad_norm", "critic_grad_norm"),
+            log=True,
+            robust=True,
         ),
-        Panel("Seconds per iteration", ("iteration_sec", "collect_sec", "build_sec", "update_sec")),
+        Panel(
+            "Seconds per iteration",
+            ("iteration_sec", "collect_sec", "build_sec", "update_sec"),
+            top=10.0,
+        ),
         Panel("Learning rate", ("learning_rate",), smooth=False),
     ]
 
@@ -214,7 +223,9 @@ def _train(
                 f"[model] does not match {source}:\n  " + "\n  ".join(differences)
             )
         trainer.actor.load_state_dict(weights["actor"])
-        if weights["critic"] is not None:
+        if trainer.critic is None:
+            pass
+        elif weights["critic"] is not None:
             trainer.critic.load_state_dict(weights["critic"])
         else:
             run.log("Source has no critic weights; the critic starts fresh.")
@@ -242,12 +253,13 @@ def _train(
     run.log(
         f"Training {game.name} on {components.device} ({config.run.precision}, "
         f"metal trunk {metal_status(components)}): "
-        f"actor {_count(trainer.actor)} params, critic {_count(trainer.critic)} params."
+        f"actor {_count(trainer.actor)} params, "
+        + ("no critic (actor value baseline)." if trainer.critic is None else f"critic {_count(trainer.critic)} params.")
     )
     dashboard = DashboardRefresher(
         run.metrics,
         run.dashboard,
-        default_panels(game.policy_heads) + game.dashboard_panels(),
+        default_panels(game.policy_heads + game.entropy_gates) + game.dashboard_panels(),
         f"{game.name} / {run.name}",
         config.run.dashboard_every,
     )

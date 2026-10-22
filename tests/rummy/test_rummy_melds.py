@@ -11,8 +11,12 @@ from cardgym.games.rummy.melds import (
     _BY_CARDSET,
     EXTENSIONS,
     MELD_CARDS,
+    MELD_COUNTS,
     MELD_POINTS,
+    MELD_SIZE,
     MELDS,
+    MELDS_WITH,
+    can_meld,
     hand_melds,
     meld_index,
     opening_melds,
@@ -110,3 +114,17 @@ def test_two_small_melds_open_together():
     # Without a spare card the opening may not use every card.
     tight = counts_of(cards("8c", "9c", "Tc", "5d", "5h", "5s"))
     assert opening_melds(tight, hand_melds(tight), 30) == []
+
+
+def test_can_meld_matches_the_meld_table():
+    """The group/run shortcut agrees with checking every meld that contains the card."""
+
+    rng = np.random.default_rng(0)
+    for _ in range(5000):
+        counts = np.zeros(NUM_CARDS, dtype=np.int64)
+        for card in rng.integers(0, NUM_CARDS, rng.integers(1, 20)):
+            counts[card] = min(2, counts[card] + 1)
+        card = int(rng.choice(np.flatnonzero(counts)))
+        rows = MELDS_WITH[card]
+        exact = ((MELD_COUNTS[rows] <= counts).all(axis=1) & (MELD_SIZE[rows] < counts.sum())).any()
+        assert can_meld(counts, card) == bool(exact)

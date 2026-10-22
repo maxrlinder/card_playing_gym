@@ -67,6 +67,28 @@ class Fence:
             self._event.synchronize()
 
 
+def upload_packed(upload, arrays: list[np.ndarray]) -> list[torch.Tensor]:
+    """Upload several host arrays with one copy per dtype; returns device views in order.
+
+    Each upload is its own blit (and on MPS its own staging copy); a rollout
+    wave uploads a dozen small arrays, so packing them saves the launches.
+    The views are contiguous slices of one flat buffer.
+    """
+
+    groups: dict[np.dtype, list[int]] = {}
+    for index, array in enumerate(arrays):
+        groups.setdefault(np.asarray(array).dtype, []).append(index)
+    result: list[torch.Tensor | None] = [None] * len(arrays)
+    for members in groups.values():
+        parts = [np.ascontiguousarray(arrays[i]).reshape(-1) for i in members]
+        flat = upload(parts[0] if len(parts) == 1 else np.concatenate(parts))
+        offset = 0
+        for i, part in zip(members, parts):
+            result[i] = flat[offset : offset + part.size].view(np.shape(arrays[i]))
+            offset += part.size
+    return result
+
+
 def to_device(array, device: torch.device) -> torch.Tensor:
     """Upload a numpy array without waiting for queued device work.
 

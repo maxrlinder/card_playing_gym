@@ -1,0 +1,97 @@
+# Piquet parties: six deals scored by the Rubicon payoff, fine-tuned from a
+# single-deal run. Each deal is a fresh context; its tokens carry the score
+# (both running totals, the lead, the deal number), so the policy can trade
+# points for the win or the rubicon line when the score makes it worth it.
+#   cardgym piquet train partie1 --config configs/piquet/partie.toml \
+#     --init-from checkpoints/piquet/p2 --reset-iteration --prepare-only
+#   CARDGYM_METAL_TRUNK=1 tools/train_supervised.sh piquet partie1 configs/piquet/partie.toml
+# (or continue the packed run: snapshots/README.md)
+# The single-deal checkpoint loads blind to the score fields (their rows start
+# equal), so the fine-tune starts from exactly its play.
+# Prepare first: the supervisor repeats its arguments on every restart, and
+# --init-from only accepts a new run.
+#
+# Throughput on the M5 Pro laptop (24 GB, MPS, bf16, Metal trunk, one rollout
+# worker): 3.7-3.8 s per update of 192 parties (1152 deals, ~36k decisions),
+# ~9.5k decisions/s, ~1.1M deals an hour; trainer ~8 GB, rollout worker ~2.5 GB.
+
+[run]
+game = "piquet"
+iterations = 1000000
+checkpoint_every = 100
+dashboard_every = 50
+device = "auto"
+precision = "bf16"
+seed = 1
+
+[rollout]
+kv_dtype = "fp16"
+# Every partie of the update in flight at once: they run in lockstep, about
+# 0.8 s alongside the update, policy lag ~1.2. (2.0 also kept the waves wide
+# but banked every other batch a version older: lag 1.65, same throughput.)
+mode = "continuous"
+concurrency = 1.0
+asynchronous = true
+workers = 1
+
+[model]
+d_model = 256
+n_layers = 16
+n_heads = 8
+n_kv_heads = 2
+d_ff = 512
+per_layer_dim = 64
+value_embeddings = "alternating"
+card_width = 32
+card_hidden = 64
+card_layers = 2
+card_kernel = 3
+score_dim = 64
+
+[ppo]
+# Half the single-deal rate: a fine-tune of a strong policy (at 3e-4 the
+# behaviour KL per update was 0.05-0.08 against ~0.01 in p2).
+learning_rate = 1.5e-4
+lr_warmup_updates = 10
+clip_ratio = 0.2
+epochs = 2
+minibatches = 2
+max_grad_norm = 1.0
+# Bootstraps across deals: a decision's advantage leans on the value at the
+# next deals' starts (lambda^30 ~ 0.2 over the rest of a deal) rather than
+# on the noise of every later deal.
+advantage_estimator = "gae"
+gae_lambda = 0.95
+# Partie payoffs: 100 for the win plus the margin (or both totals when the
+# loser is rubiconed), typically 100-300.
+value_reward_scale = 100.0
+actor_value_coef = 0.5
+actor_baseline = "rollout"
+# The value head learned deal margins; for its first 50 updates (4 steps
+# each) only it and the prediction heads train, then the policy follows
+# (value correlation was ~0.3 at the start and still rising at 20 updates).
+policy_warmup_steps = 200
+auxiliary_grad_fraction = 0.25
+auxiliary_grad_refresh = 4
+entropy_mode = "adaptive"
+entropy_targets = { exchange = 0.05, declare = 0.05, play = 0.05 }
+microbatch_positions = 16384
+device_cache_gb = 6.0
+sequence_bucket_width = 64
+min_group_sequences = 32
+
+[game]
+modes = ["rubicon"]
+# 192 parties: 1152 deals, about 35k decisions per update.
+games_per_mode = 192
+
+[losses]
+belief = 0.2
+tricks = 0.1
+declarations = 0.1
+points = 0.1
+bonus = 0.05
+trick = 0.1
+opp_suits = 0.1
+opp_next = 0.1
+fate = 0.1

@@ -73,6 +73,9 @@ class Game(abc.ABC):
     GameConfig: ClassVar[type]
     LossConfig: ClassVar[type]
     policy_heads: ClassVar[tuple[str, ...]]
+    # Binary splits of a head's candidates with their own entropy target
+    # (the hooks' ``gates`` and ``gate_side``); names share entropy_targets.
+    entropy_gates: ClassVar[tuple[str, ...]] = ()
 
     def __init__(self, model: Any, game: Any, losses: Any) -> None:
         self.model_config = model
@@ -90,16 +93,19 @@ class Game(abc.ABC):
         """Longest actor stream."""
 
     @property
-    @abc.abstractmethod
     def critic_max_length(self) -> int:
         """Longest critic stream."""
+
+        return self.max_length
 
     # -- models ----------------------------------------------------------
     @abc.abstractmethod
     def build_actor(self) -> PolicyModel: ...
 
-    @abc.abstractmethod
-    def build_critic(self) -> CriticModel: ...
+    def build_critic(self) -> CriticModel | None:
+        """The privileged critic, or None: the actor's own value head is then the baseline."""
+
+        return None
 
     # -- self-play -------------------------------------------------------
     @abc.abstractmethod

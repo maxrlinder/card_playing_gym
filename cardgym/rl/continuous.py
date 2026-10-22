@@ -39,7 +39,7 @@ from dataclasses import dataclass, field, replace
 import numpy as np
 import torch
 
-from cardgym.core.devices import DTYPES, Fence, autocast_context, release_device_memory, to_device
+from cardgym.core.devices import DTYPES, Fence, autocast_context, release_device_memory, to_device, upload_packed
 
 from .selfplay import (
     CollectionStats,
@@ -48,6 +48,8 @@ from .selfplay import (
     _Live,
     _round_up,
     launch_policies,
+    receive_launched,
+    restart_contexts,
     sample_decisions,
 )
 
@@ -118,10 +120,13 @@ class ContinuousCollector:
         kv_dtype: str,
         max_length: int,
         cohorts: int = 1,
+        record_values: bool = False,
     ) -> None:
         self.model = model
         self.device = device
         self.precision = precision
+        # Record player_values with each decision ([ppo] actor_baseline = "rollout").
+        self.record_values = record_values
         self.kv_dtype = DTYPES[kv_dtype]
         self.cohorts = max(1, cohorts)
         # One spare position past the longest stream absorbs ragged padding.
@@ -246,14 +251,15 @@ class ContinuousCollector:
             self._expect_readout(state, queued)
             return
 
-    def _record(self, state: _Live, blocks: list[np.ndarray]) -> list[tuple[int, np.ndarray]]:
-        queued = []
+    def _record(self, state: _Live, blocks: list[np.ndarray], restart: bool = False) -> list[tuple[int, np.ndarray]]:
+        """Record every observer's new tokens; returns those to decode (after any context restart)."""
+
         for seat, block in enumerate(blocks):
             if len(block):
                 state.blocks[seat].append(block)
-                queued.append((seat, block))
                 self._width = block.shape[1]
-        return queued
+        decoded = restart_contexts(state, blocks) if restart else blocks
+        return [(seat, block) for seat, block in enumerate(decoded) if len(block)]
 
     @staticmethod
     def _expect_readout(state: _Live, queued: list[tuple[int, np.ndarray]]) -> None:
@@ -321,23 +327,21 @@ class ContinuousCollector:
             positions[index] = position
             offsets[index] = len(block) - 1
         span = _round_up(int(positions.max()) + run, self.SPAN_BUCKET)
+        read = np.asarray([entry for entry, _ in readouts], dtype=np.int64)
+        tokens_d, positions_d, offsets_d, rows_d, index, read_offsets = upload_packed(
+            upload, [tokens, positions, offsets, cache_rows, read, offsets[read]]
+        )
         with autocast_context(self.device, self.precision):
             hidden = self.model.forward_ragged(
-                upload(tokens),
-                upload(positions),
-                self._cache,
-                upload(offsets),
-                span=span,
-                rows=upload(cache_rows),
+                tokens_d, positions_d, self._cache, offsets_d, span=span, rows=rows_d
             )
         context = self.model.pop_context()
-        index = upload(np.asarray([entry for entry, _ in readouts], dtype=np.int64))
         if context is not None:
-            context = context[index, upload(offsets[[entry for entry, _ in readouts]])]
+            context = context[index, read_offsets]
         wave = self._waves[cohort]
         wave.launched = launch_policies(
             self.model, self.device, self.precision, upload,
-            hidden[index], [state for _, state in readouts], context,
+            hidden[index], [state for _, state in readouts], context, values=self.record_values,
         )
         wave.fence = Fence(self.device)
         self.stats.waves += 1
@@ -353,10 +357,7 @@ class ContinuousCollector:
         if wave.fence is not None:
             wave.fence.wait()
         self.stats.wait_sec += time.perf_counter() - started
-        for states, logits in wave.launched:
-            values = logits.numpy()
-            for row, state in enumerate(states):
-                state.logits = values[row]
+        receive_launched(wave.launched)
         self._waves[cohort] = _Wave()
 
     def _act(self, cohort: int, lanes: list[Lane], rng: random.Random, version: int) -> None:
@@ -368,7 +369,7 @@ class ContinuousCollector:
         t1 = time.perf_counter()
         for slot in live:
             state = slot.state
-            queued = self._record(state, state.game.step(state.decisions[-1].action))
+            queued = self._record(state, state.game.step(state.decisions[-1].action), restart=True)
             if state.game.done():
                 self._finished[lanes[slot.lane].name].append(self._finish(state))
                 slot.state = None
