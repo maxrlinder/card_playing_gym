@@ -1,0 +1,66 @@
+[run]
+game = "piquet"
+iterations = 1000000
+checkpoint_every = 100
+dashboard_every = 50
+device = "auto"
+precision = "bf16"
+seed = 1
+
+[rollout]
+kv_dtype = "fp16"
+mode = "continuous"
+concurrency = 1.0
+asynchronous = true
+workers = 1
+
+[model]
+d_model = 256
+n_layers = 16
+n_heads = 8
+n_kv_heads = 2
+d_ff = 512
+per_layer_dim = 64
+value_embeddings = "alternating"
+card_width = 32
+card_hidden = 64
+card_layers = 2
+card_kernel = 3
+score_dim = 64
+
+[ppo]
+learning_rate = 0.00015
+lr_warmup_updates = 10
+clip_ratio = 0.2
+epochs = 2
+minibatches = 2
+max_grad_norm = 1.0
+advantage_estimator = "gae"
+gae_lambda = 0.95
+value_reward_scale = 100.0
+actor_value_coef = 0.5
+actor_baseline = "rollout"
+policy_warmup_steps = 200
+auxiliary_grad_fraction = 0.25
+auxiliary_grad_refresh = 4
+entropy_mode = "adaptive"
+entropy_targets = { exchange = 0.05, declare = 0.05, play = 0.05 }
+microbatch_positions = 16384
+device_cache_gb = 6.0
+sequence_bucket_width = 64
+min_group_sequences = 32
+
+[game]
+modes = ["rubicon"]
+games_per_mode = 192
+
+[losses]
+belief = 0.2
+tricks = 0.1
+declarations = 0.1
+points = 0.1
+bonus = 0.05
+trick = 0.1
+opp_suits = 0.1
+opp_next = 0.1
+fate = 0.1

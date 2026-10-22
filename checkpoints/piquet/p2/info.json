@@ -1,0 +1,19 @@
+{
+  "exported_at": "2026-10-22T13:25:50Z",
+  "files": {
+    "actor.pt": {
+      "bytes": 36385478,
+      "sha256": "d0080a47fd97e251442fc3c3fb9e8ce90fcbfee8f5809b1dd6ba1d21f5e0b3b8"
+    },
+    "critic.pt": {
+      "bytes": 5703,
+      "sha256": "c4b7c06e93c442fa00a58bd3684b59213b747b76df573c96ff176d7b7d943cd9"
+    }
+  },
+  "game": "piquet",
+  "iteration": 13600,
+  "source": {
+    "checkpoint": "iter_013600.pt",
+    "run": "p2"
+  }
+}
