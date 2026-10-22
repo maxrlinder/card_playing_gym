@@ -1,0 +1,106 @@
+# partie.toml on CUDA: the same training (parties, PPO, model, losses, games
+# per update), with execution settings for an 8 GB Turing card (RTX 2070
+# Super): fp16 instead of bf16 (Turing has fp16 tensor cores; bf16 is
+# emulated: 4.2 against 24.8 TFLOPS), larger microbatches, tight length
+# buckets, and two rollout cohorts. Continue the packed run with it:
+#   .venv/bin/python tools/run_snapshot.py unpack snapshots/piquet/partie1
+#   .venv/bin/python -m cardgym piquet train partie1 --config configs/piquet/partie-cuda.toml \
+#     --reconfigure --reason "CUDA execution settings"
+#   tools/train_supervised.sh piquet partie1 configs/piquet/partie-cuda.toml
+# CUDA graphs for every rollout wave (cardgym.rl.graphs), torch.compile for
+# the trunk and the waves (cardgym.nn.compile), and the fused decode
+# attention (cardgym.nn.cuda_decode) switch on by themselves on CUDA.
+
+[run]
+game = "piquet"
+iterations = 1000000
+checkpoint_every = 100
+dashboard_every = 50
+device = "auto"
+# Autocast fp16 with dynamic loss scaling (PPOTrainer.loss_scale).
+precision = "fp16"
+seed = 1
+
+[rollout]
+kv_dtype = "fp16"
+# Every partie of the update in flight at once: they run in lockstep, about
+# 0.8 s alongside the update, policy lag ~1.2. (2.0 also kept the waves wide
+# but banked every other batch a version older: lag 1.65, same throughput.)
+mode = "continuous"
+concurrency = 1.0
+asynchronous = true
+# Collection is host-bound (game rules and tokens in Python, ~190 waves of
+# lockstep parties per update) and this CPU has 8 cores: two workers took an
+# iteration from 4.65 to 3.6 s (each worker ~0.7 GB of GPU, ~1.1 GB of RAM).
+workers = 2
+# Two halves of each worker's parties alternate: the host steps one half's
+# games while the GPU decodes the other's wave (standalone 3.9 -> 3.3 s).
+cohorts = 2
+
+[model]
+d_model = 256
+n_layers = 16
+n_heads = 8
+n_kv_heads = 2
+d_ff = 512
+per_layer_dim = 64
+value_embeddings = "alternating"
+card_width = 32
+card_hidden = 64
+card_layers = 2
+card_kernel = 3
+score_dim = 64
+
+[ppo]
+# Half the single-deal rate: a fine-tune of a strong policy (at 3e-4 the
+# behaviour KL per update was 0.05-0.08 against ~0.01 in p2).
+learning_rate = 1.5e-4
+lr_warmup_updates = 10
+clip_ratio = 0.2
+epochs = 2
+minibatches = 2
+max_grad_norm = 1.0
+# Bootstraps across deals: a decision's advantage leans on the value at the
+# next deals' starts (lambda^30 ~ 0.2 over the rest of a deal) rather than
+# on the noise of every later deal.
+advantage_estimator = "gae"
+gae_lambda = 0.95
+# Partie payoffs: 100 for the win plus the margin (or both totals when the
+# loser is rubiconed), typically 100-300.
+value_reward_scale = 100.0
+actor_value_coef = 0.5
+actor_baseline = "rollout"
+# The value head learned deal margins; for its first 50 updates (4 steps
+# each) only it and the prediction heads train, then the policy follows
+# (value correlation was ~0.3 at the start and still rising at 20 updates).
+policy_warmup_steps = 200
+auxiliary_grad_fraction = 0.25
+auxiliary_grad_refresh = 4
+entropy_mode = "adaptive"
+entropy_targets = { exchange = 0.05, declare = 0.05, play = 0.05 }
+# 16k positions: 2.10 s an update standalone at a 2.7 GB peak (24k: 1.97 s at
+# 4.3 GB, which with two rollout workers and a desktop reached the 8 GB card's
+# limit and made the allocator flush its cache mid-update).
+microbatch_positions = 16384
+# The trainer returns its allocator cache past 4 GB.
+device_cache_gb = 4.0
+# Deals are 45-53 tokens; buckets of 64 padded every one to 59 (16% of the
+# update's work on padding), buckets of 4 pad 2.5% in three groups.
+sequence_bucket_width = 4
+min_group_sequences = 32
+
+[game]
+modes = ["rubicon"]
+# 192 parties: 1152 deals, about 35k decisions per update.
+games_per_mode = 192
+
+[losses]
+belief = 0.2
+tricks = 0.1
+declarations = 0.1
+points = 0.1
+bonus = 0.05
+trick = 0.1
+opp_suits = 0.1
+opp_next = 0.1
+fate = 0.1

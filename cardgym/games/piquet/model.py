@@ -252,6 +252,24 @@ def _bag(ids: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return F.embedding_bag(flat, weight, mode="sum").view(*ids.shape[:-1], weight.shape[-1])
 
 
+def _onehot_bags(ids: torch.Tensor, tables: list[torch.Tensor]) -> list[torch.Tensor]:
+    """CUDA: every table's field sums as one GEMM of the tokens' one-hot rows against the tables side by side.
+
+    Under autocast the GEMM runs on fp16 tensor cores (fp32 accumulation, so
+    each sum is rounded once, like any linear layer's output) and its
+    backward is one more GEMM. ``embedding_bag`` measured 20 ms forward and
+    backward per 14k-token microbatch on an RTX 2070 Super (its backward
+    scatters every token's gradient); this, 4 ms for all three tables.
+    """
+
+    flat = ids.reshape(-1, ids.shape[-1])
+    dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else tables[0].dtype
+    hot = torch.zeros(flat.shape[0], tables[0].shape[0], device=ids.device, dtype=dtype).scatter_(1, flat, 1.0)
+    widths = [table.shape[1] for table in tables]
+    sums = hot @ torch.cat(tables, dim=1).to(dtype)
+    return [part.view(*ids.shape[:-1], width) for part, width in zip(sums.split(widths, dim=1), widths)]
+
+
 def migrate_field_table(old: torch.Tensor) -> torch.Tensor:
     """A field table of the pre-partie layout (LEGACY_FIELD_VOCAB) in the current one.
 
@@ -315,6 +333,8 @@ class PiquetEmbedding(nn.Module):
             from cardgym.nn.metal_bag import FieldBags
 
             sums = [value.view(*ids.shape[:-1], -1) for value in FieldBags.apply(ids.reshape(-1, NUM_FIELDS), *tables)]
+        elif tokens.device.type == "cuda":
+            sums = _onehot_bags(ids, tables)
         else:
             sums = [_bag(ids, table) for table in tables]
         sums = iter(sums)
@@ -345,6 +365,9 @@ class CardScorer(nn.Module):
 
 class PiquetActor(PolicyModel):
     policy_heads = HEADS
+    # Every head reads only the readout state and its grid features: rollout
+    # waves can run as CUDA graphs (cardgym.rl.graphs).
+    graphable_heads = True
 
     def __init__(self, config: PiquetModelConfig) -> None:
         super().__init__(config.trunk())

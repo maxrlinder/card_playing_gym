@@ -133,7 +133,8 @@ def device_allocated_bytes(device: torch.device) -> int:
     if device.type == "mps":
         return int(torch.mps.driver_allocated_memory())
     if device.type == "cuda":
-        return int(torch.cuda.memory_allocated(device))
+        # Reserved, like MPS's driver allocation: the cache ceiling bounds what the process holds.
+        return int(torch.cuda.memory_reserved(device))
     return 0
 
 

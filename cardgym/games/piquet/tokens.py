@@ -300,7 +300,7 @@ class ObservationWriter:
         row[F_ACTOR] = 1
         legal = 0
         if engine.phase == EXCHANGE:
-            row[F_COUNT] = bin(engine.selected).count("1")
+            row[F_COUNT] = engine.selected.bit_count()
             row[F_LIMIT] = engine.max_discards
             row[F_CARD] = self.last_selected[seat]
             legal = engine.legal_mask()

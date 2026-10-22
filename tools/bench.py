@@ -53,6 +53,8 @@ def _components(game: str, run_name: str, overrides: list[str]):
 def _sync(device: torch.device) -> None:
     if device.type == "mps":
         torch.mps.synchronize()
+    elif device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 def record(args: argparse.Namespace) -> int:

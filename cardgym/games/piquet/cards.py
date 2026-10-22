@@ -78,14 +78,15 @@ FACE_MASK = mask_of(card_id(s, r) for s in range(NUM_SUITS) for r in (JACK, QUEE
 CARD_RANKS = np.array([rank_of(card) for card in range(NUM_CARDS)], dtype=np.int64)
 CARD_SUITS = np.array([suit_of(card) for card in range(NUM_CARDS)], dtype=np.int64)
 
-# Bit i of a byte, for turning masks into boolean card arrays in one lookup.
-_BYTE_BITS = ((np.arange(256)[:, None] >> np.arange(8)[None, :]) & 1).astype(bool)
+# Bit i of a 16-bit half, for turning masks into boolean card arrays in two lookups
+# (self-play builds ~150k of them per update; per byte took 2.2 us, this 0.9 us).
+_HALF_BITS = ((np.arange(1 << 16)[:, None] >> np.arange(16)[None, :]) & 1).astype(bool)
 
 
 def mask_array(mask: int) -> np.ndarray:
     """bool [32]: whether each card is in the mask."""
 
-    return _BYTE_BITS[[mask & 0xFF, (mask >> 8) & 0xFF, (mask >> 16) & 0xFF, (mask >> 24) & 0xFF]].reshape(NUM_CARDS)
+    return np.concatenate((_HALF_BITS[mask & 0xFFFF], _HALF_BITS[mask >> 16]))
 
 
 def format_cards(mask: int) -> str:

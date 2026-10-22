@@ -235,7 +235,7 @@ class PiquetEngine:
 
         hand = self.hands[self.current]
         if self.phase == EXCHANGE:
-            if bin(self.selected).count("1") >= self.max_discards:
+            if self.selected.bit_count() >= self.max_discards:
                 return 0
             return hand & ~self.selected
         if self.phase == PLAY:
@@ -254,11 +254,25 @@ class PiquetEngine:
         legal = np.zeros(ACTIONS[self.head], dtype=bool)
         legal[:NUM_CARDS] = mask_array(self.legal_mask())
         if self.phase == EXCHANGE:
-            legal[STOP] = bin(self.selected).count("1") >= self.min_discards
+            legal[STOP] = self._may_stop()
         return legal
 
+    def _may_stop(self) -> bool:
+        return self.selected.bit_count() >= self.min_discards
+
+    def _is_legal(self, action: int) -> bool:
+        """``legal()[action]`` from the masks, without building the array."""
+
+        if self.done:
+            raise RuntimeError("The partie is over.")
+        if self.phase == DECLARE:
+            return action in (QUIET, SPEAK)
+        if self.phase == EXCHANGE and action == STOP:
+            return self._may_stop()
+        return 0 <= action < NUM_CARDS and bool(self.legal_mask() >> action & 1)
+
     def apply(self, action: int) -> None:
-        if not self.legal()[action]:
+        if not self._is_legal(action):
             raise ValueError(f"Illegal {self.head} action {action}.")
         self._apply(action)
         self._advance()
@@ -285,10 +299,12 @@ class PiquetEngine:
         while not self.done:
             if self.phase == DECLARE:
                 return  # declarations only wait when there is a choice
-            legal = self.legal()
-            if legal.sum() > 1:
+            cards = self.legal_mask()
+            stop = self.phase == EXCHANGE and self._may_stop()
+            if cards.bit_count() + stop > 1:
                 return
-            self._apply(int(np.flatnonzero(legal)[0]))
+            # The one legal action: a card (the lowest set bit) or STOP.
+            self._apply((cards & -cards).bit_length() - 1 if cards else STOP)
 
     # -- exchange --------------------------------------------------------------
 
@@ -304,7 +320,7 @@ class PiquetEngine:
 
     def _exchange(self) -> None:
         seat = self.current
-        count = bin(self.selected).count("1")
+        count = self.selected.bit_count()
         drawn = self.talon[:count]
         self.talon = self.talon[count:]
         drawn_mask = mask_of(drawn)

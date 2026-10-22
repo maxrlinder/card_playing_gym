@@ -115,6 +115,12 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x.float(), (x.shape[-1],), eps=self.eps).to(x.dtype) * self.weight
 
 
+def _cuda_decode_supported(head_dim: int, span: int, queries: int) -> bool:
+    from .cuda_decode import supported
+
+    return supported(head_dim, span, queries)
+
+
 class DecoderBlock(nn.Module):
     def __init__(self, config: TrunkConfig) -> None:
         super().__init__()
@@ -194,6 +200,19 @@ class DecoderBlock(nn.Module):
         """
 
         q, k, v = self._qkv(self.ln_attn(x), value_embedding)
+        if (
+            x.is_cuda
+            and cache.dtype == torch.float16
+            and _cuda_decode_supported(self.head_dim, span, self.head_group * x.shape[1])
+        ):
+            # Attention straight from the pool, no per-layer gather (cardgym.nn.cuda_decode).
+            from .cuda_decode import decode_attention
+
+            if rows is None:
+                rows = torch.arange(x.shape[0], device=x.device)
+            cache.write_step(layer, rows, write_positions, k, v)
+            attn = decode_attention(q, cache.k[layer], cache.v[layer], rows, key_lengths, span, self.scale)
+            return self._finish(x, attn.to(x.dtype))
         if rows is None:
             cache.write_step(layer, torch.arange(x.shape[0], device=x.device), write_positions, k, v)
             k_all, v_all = cache.read(layer, None, span, count=x.shape[0])

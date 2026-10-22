@@ -104,3 +104,16 @@ relocates them).
 Python 3.11 or 3.12. The lock file pins a PyTorch nightly for Apple-silicon
 macOS: the fused Metal trunk uses `torch.mps.compile_shader`. Everything else
 runs on any PyTorch with `scaled_dot_product_attention(enable_gqa=...)`.
+
+On Linux with an NVIDIA GPU the lock does not apply; build the environment by
+hand:
+
+```bash
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
+uv pip install --python .venv/bin/python -e . pytest ninja
+```
+
+CUDA runs compile the trunk (`torch.compile`), replay every rollout wave as a
+CUDA graph, and build a small decode-attention extension on first use (nvcc
+and ninja); see [Piquet on CUDA](docs/piquet.md#cuda).

@@ -201,6 +201,33 @@ worker made it slower still (4.7 s per iteration). 32k microbatches run at
 3.4 s per iteration, but the trainer's footprint then peaks near 15 GB
 against ~10-11 GB at 16k.
 
+### CUDA
+
+`configs/piquet/partie-cuda.toml` runs the same training on an RTX 2070
+Super (8 GB, Turing, 8-core CPU). Turing has fp16 tensor cores and emulates
+bf16 (4.2 against 24.8 TFLOPS), so it trains under fp16 autocast with
+dynamic loss scaling (`PPOTrainer.loss_scale`; master weights and Adam stay
+fp32). Measured on parties (192 per update):
+
+| Step | Update (bench) | Collection (bench) |
+| --- | --- | --- |
+| bf16 as on the Mac, eager | 10.0 s | 7.3 s |
+| fp16 | 3.5 s | 7.2 s |
+| `torch.compile` of the trunk (`cardgym.nn.compile`), no MPS row padding | 2.6 s | |
+| field lookups as one one-hot GEMM (`embedding_bag`'s backward: 13 ms per microbatch), fused Adam | 2.1 s | |
+| every rollout wave one CUDA graph replay (`cardgym.rl.graphs`; ~19 ms of kernel launches a wave) | | 5.5 s |
+| decode attention from the cache in place (`cardgym.nn.cuda_decode`), compiled waves | | 4.5 s |
+| piquet engine: masks without numpy, no redundant legality checks | | 3.9 s |
+| two cohorts (host steps one half while the GPU decodes the other) | | 3.3 s |
+| length buckets of 4 (deals are 45-53 tokens; 64 padded each to 59) | ~1.9 s | |
+
+In a real run, with two rollout workers and the trainer sharing the GPU, an
+iteration takes 3.6-3.7 s (the Mac averaged 4.5 s over the 50 iterations
+before the move): the update runs at ~3.3 s, the rollout at ~2.9 s behind
+it. The GPU is the shared bottleneck: CUDA MPS let the update overlap the
+rollout's kernels (2.5 s) but slowed the rollout's waves as much, even on a
+high-priority stream. `behavior_kl` fell from 0.016 (bf16) to ~0.006.
+
 ## Parties
 
 A partie is six deals scored by the Rubicon payoff. Playing for points is

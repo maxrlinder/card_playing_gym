@@ -55,9 +55,10 @@ from .tokens import CARD_START, F_KIND, KIND_DECISION, UNCERTAIN
 IGNORE = -1
 POINTS_SCALE = 50.0
 NOBODY = 2
-# Prediction rows are padded to a multiple of this: MPS compiles a graph per
-# tensor shape, and with every microbatch a different size the heads' graphs
-# were recompiled each time (1.1 s an update at 16k-position microbatches).
+# On MPS prediction rows are padded to a multiple of this: MPS compiles a
+# graph per tensor shape, and with every microbatch a different size the
+# heads' graphs were recompiled each time (1.1 s an update at 16k-position
+# microbatches). Elsewhere the padding is only wasted work.
 ROW_BUCKET = 8192
 
 
@@ -170,7 +171,9 @@ def training_sequences(trajectory: Trajectory) -> GameSequences:
     assert isinstance(game, PiquetSelfPlay)
     actor = {}
     for seat in (0, 1):
-        stream = trajectory.streams[seat].astype(np.int64)
+        # Kept int16 (build_batch widens it): the asynchronous rollout pickles
+        # every sequence to the trainer, and int64 tokens were 4/5 of it.
+        stream = trajectory.streams[seat]
         labels = seat_labels(game, seat, stream)
         deals = np.asarray([meta[0] for meta in game.meta[seat]])
         bounds = [0, *np.flatnonzero(np.diff(deals)) + 1, len(stream)]
@@ -202,6 +205,7 @@ class PiquetHooks:
         self.losses = losses
         self.device = device
         self.precision = precision
+        self.row_bucket = ROW_BUCKET if device.type == "mps" else 1
         # Host arrays -> device; the trainer installs its non-blocking uploader.
         self.upload = lambda array: torch.from_numpy(np.ascontiguousarray(array)).to(device)
 
@@ -217,7 +221,7 @@ class PiquetHooks:
         if max(coefficients.values()) <= 0:
             return None
         count = len(dense)
-        padded = -(-count // ROW_BUCKET) * ROW_BUCKET
+        padded = -(-count // self.row_bucket) * self.row_bucket
         # Padding rows read position 0 with weight zero and ignored labels.
         at = torch.cat([dense.flat, dense.flat.new_zeros(padded - count)])
         weight = torch.cat([dense.weight, dense.weight.new_zeros(padded - count)])

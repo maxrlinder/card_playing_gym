@@ -21,7 +21,14 @@ CARDGYM_METAL_TRUNK=1 tools/train_supervised.sh piquet partie1 configs/piquet/pa
 The train command then resumes exactly where the run stopped: weights, Adam
 state, entropy temperatures, RNG, iteration count, metrics and dashboard.
 `CARDGYM_METAL_TRUNK=1` applies only on Apple silicon; elsewhere leave it
-out. `[run] device = "auto"` picks CUDA, MPS or CPU.
+out. `[run] device = "auto"` picks CUDA, MPS or CPU. On an NVIDIA GPU, adopt
+the CUDA execution settings once, then supervise with them:
+
+```bash
+.venv/bin/python -m cardgym piquet train partie1 --config configs/piquet/partie-cuda.toml \
+  --reconfigure --reason "CUDA execution settings" --prepare-only
+tools/train_supervised.sh piquet partie1 configs/piquet/partie-cuda.toml
+```
 
 To pack a run again afterwards:
 

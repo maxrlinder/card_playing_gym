@@ -48,6 +48,7 @@ from cardgym.core.devices import (
     device_allocated_bytes,
     release_device_memory,
 )
+from cardgym.nn.compile import compiled
 from cardgym.nn.packing import Packing
 
 from .batch import DecisionRows, PPOBatch, RowIndex, SequenceGroup, microbatches
@@ -224,11 +225,11 @@ def _accumulate(
 def configure_adam(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
     """Select the Adam kernel for ``device`` without resetting saved moments.
 
-    Fused MPS Adam needs its step counters on the device; ordinary Adam
-    wants them on the CPU. Checkpoints can come from either.
+    Fused Adam (MPS, CUDA) needs its step counters on the device; ordinary
+    Adam wants them on the CPU. Checkpoints can come from either.
     """
 
-    fused = device.type == "mps"
+    fused = device.type in ("mps", "cuda")
     counter_device = device if fused else torch.device("cpu")
     for group in optimizer.param_groups:
         group["fused"] = fused
@@ -249,6 +250,40 @@ def standardize_grads(parameters: Sequence[torch.Tensor]) -> None:
         grad = parameter.grad
         if grad is not None and grad.stride() != parameter.stride():
             parameter.grad = grad.contiguous()
+
+
+class LossScale:
+    """Dynamic loss scaling for fp16 autocast (bf16 shares fp32's range and needs none).
+
+    fp16 activations' gradients flush to zero below ~6e-8, so every loss is
+    multiplied by ``scale`` before its backward and every gradient divided
+    by it right after, before the norms, the auxiliary budget, the clip, and
+    the step: everything downstream sees true gradients. A step whose
+    gradient is not finite is skipped (as any non-finite step is) and halves
+    the scale; ``interval`` finite steps in a row double it.
+    """
+
+    def __init__(self, scale: float = 2.0**12, interval: int = 500) -> None:
+        self.scale = scale
+        self.interval = interval
+        self.good_steps = 0
+
+    def update(self, finite: bool) -> None:
+        if not finite:
+            self.scale = max(self.scale / 2.0, 1.0)
+            self.good_steps = 0
+            return
+        self.good_steps += 1
+        if self.good_steps >= self.interval:
+            self.scale = min(self.scale * 2.0, 2.0**24)
+            self.good_steps = 0
+
+    def state_dict(self) -> dict:
+        return {"scale": self.scale, "good_steps": self.good_steps}
+
+    def load_state_dict(self, state: dict) -> None:
+        self.scale = float(state["scale"])
+        self.good_steps = int(state["good_steps"])
 
 
 # Candidate-list widths at which a head's decisions are split (see _width_buckets).
@@ -347,11 +382,14 @@ class PPOTrainer:
             )
         self.actor = actor.to(device)
         self.critic = None if critic is None else critic.to(device)
+        # Full causal forwards, compiled on CUDA (cardgym.nn.compile).
+        self._actor_hidden = compiled(self.actor.forward_hidden, device)
+        self._critic_hidden = None if self.critic is None else compiled(self.critic.forward_hidden, device)
         self.actor_parameters = [p for p in self.actor.parameters() if p.requires_grad]
         self.critic_parameters = (
             [] if self.critic is None else [p for p in self.critic.parameters() if p.requires_grad]
         )
-        fused = device.type == "mps"
+        fused = device.type in ("mps", "cuda")
         self.actor_optimizer = torch.optim.Adam(
             self.actor_parameters, lr=config.learning_rate, betas=config.adam_betas, fused=fused
         )
@@ -368,13 +406,16 @@ class PPOTrainer:
         if len(set(self.gates.values())) != len(self.gates):
             raise ValueError("At most one entropy gate per policy head.")
         self.entropy = EntropyController(tuple(policy_heads) + tuple(self.gates), config, device)
+        self.loss_scale = LossScale() if precision == "fp16" else None
         # Every host array an update reads goes up without draining the queue.
         self.upload = Uploader(device)
-        self.cache_ceiling = (
-            int(config.device_cache_gb * 2**30 or 0.6 * torch.mps.recommended_max_memory())
-            if device.type == "mps"
-            else 0
-        )
+        if device.type == "mps":
+            self.cache_ceiling = int(config.device_cache_gb * 2**30 or 0.6 * torch.mps.recommended_max_memory())
+        elif device.type == "cuda":
+            total = torch.cuda.get_device_properties(device).total_memory
+            self.cache_ceiling = int(config.device_cache_gb * 2**30 or 0.6 * total)
+        else:
+            self.cache_ceiling = 0
         if hasattr(hooks, "upload"):
             hooks.upload = self.upload
         self.optimizer_steps = 0
@@ -421,6 +462,7 @@ class PPOTrainer:
                 # Warm-up steps backpropagate the auxiliary losses alone, unscaled.
                 lagged = 1.0 if warming else self._lagged_auxiliary_scale()
                 self._actor_backward(batch, indexes, epoch_totals, minibatch, lagged, train_policy=not warming)
+                self._unscale(self.actor_parameters, self._policy_grads, self._auxiliary_grads)
                 if warming:
                     policy_norm, auxiliary_norm, scale = 0.0, float("nan"), 1.0
                     stats["policy_warmup_steps"] = stats.get("policy_warmup_steps", 0.0) + 1.0
@@ -439,6 +481,8 @@ class PPOTrainer:
                     # A non-finite gradient must never reach the weights or Adam's moments.
                     self.actor_optimizer.zero_grad(set_to_none=True)
                     stats["skipped_actor_steps"] += 1.0
+                if self.loss_scale is not None:
+                    self.loss_scale.update(math.isfinite(grad_norm))
             # The entropy temperatures see the whole epoch's entropy, once.
             reduced = _reduce(epoch_totals)
             observed = {
@@ -457,6 +501,8 @@ class PPOTrainer:
         for head in self.entropy.heads:
             stats[f"entropy_alpha_{head}"] = self.entropy.alpha(head)
         stats["learning_rate"] = float(self.actor_optimizer.param_groups[0]["lr"])
+        if self.loss_scale is not None:
+            stats["loss_scale"] = self.loss_scale.scale
         stats["peak_device_bytes"] = float(device_allocated_bytes(self.device))
         if self.critic is not None:
             for _ in range(1, self.config.critic_epochs):
@@ -664,7 +710,7 @@ class PPOTrainer:
                         dual = DualTrunkPass(self.actor, micro.tokens, micro.bounds)
                         hidden, context = dual.hidden, dual.context
                     else:
-                        hidden = self.actor.forward_hidden(micro.tokens, micro.bounds)
+                        hidden = self._actor_hidden(micro.tokens, micro.bounds)
                         context = self.actor.pop_context()
                 dense = self._dense_rows(group, micro)
                 auxiliary = torch.zeros((), device=self.device)
@@ -803,7 +849,22 @@ class PPOTrainer:
         totals[f"{prefix}_weight"].append(dense.weight.sum().detach())
         return loss
 
+    def _scaled(self, loss: torch.Tensor) -> torch.Tensor:
+        return loss if self.loss_scale is None else loss * self.loss_scale.scale
+
+    def _unscale(self, parameters: Sequence[torch.Tensor], *stashes: list[torch.Tensor | None] | None) -> None:
+        """Divide the loss scale out of ``.grad`` and the stashed gradients."""
+
+        if self.loss_scale is None:
+            return
+        gradients = [p.grad for p in parameters if p.grad is not None]
+        for stash in stashes:
+            gradients += [] if stash is None else [g for g in stash if g is not None]
+        if gradients:
+            torch._foreach_mul_(gradients, 1.0 / self.loss_scale.scale)
+
     def _backward(self, auxiliary: torch.Tensor, policy: torch.Tensor, dual, lagged: float | None = None) -> None:
+        auxiliary, policy = self._scaled(auxiliary), self._scaled(policy)
         if lagged is not None:
             total = policy + lagged * auxiliary
             if total.requires_grad:
@@ -870,7 +931,7 @@ class PPOTrainer:
                 parameter.grad = a.mul_(scale) if scale != 1.0 else a
             else:
                 parameter.grad = None
-        if policy_norm > 0 and auxiliary_norm > 0:
+        if policy_norm > 0 and auxiliary_norm > 0 and math.isfinite(scale):
             self._auxiliary_scale = scale
             self._auxiliary_norms = (policy_norm, auxiliary_norm)
         return policy_norm, auxiliary_norm, scale
@@ -910,7 +971,7 @@ class PPOTrainer:
         for group_index, group in enumerate(batch.actor_groups):
             for micro in self._microbatches(self.actor, group):
                 with autocast_context(self.device, self.precision):
-                    hidden = self.actor.forward_hidden(micro.tokens, micro.bounds)
+                    hidden = self._actor_hidden(micro.tokens, micro.bounds)
                     self.actor.pop_context()
                     values = self.actor.player_values(hidden.reshape(-1, hidden.shape[-1]))
                 counts = self.upload(micro.per_row(group.player_counts[micro.start : micro.stop]))
@@ -933,7 +994,7 @@ class PPOTrainer:
         for group_index, group in enumerate(batch.critic_groups):
             for micro in self._microbatches(self.critic, group):
                 with autocast_context(self.device, self.precision):
-                    hidden = self.critic.forward_hidden(micro.tokens, micro.bounds)
+                    hidden = self._critic_hidden(micro.tokens, micro.bounds)
                 dense = self._dense_rows(group, micro)
                 values = None
                 if baseline is not None:
@@ -951,8 +1012,9 @@ class PPOTrainer:
                 )
                 if hooked is not None:
                     loss = loss + hooked
-                loss.backward()
+                self._scaled(loss).backward()
                 pending.append(loss.detach())
+        self._unscale(self.critic_parameters)
         progress.grad_norm = clip_grad_norm(self.critic_parameters, self.config.max_grad_norm)
         if math.isfinite(progress.grad_norm):
             standardize_grads(self.critic_parameters)
@@ -988,6 +1050,8 @@ class PPOTrainer:
             "entropy": self.entropy.state_dict(),
             "optimizer_steps": self.optimizer_steps,
         }
+        if self.loss_scale is not None:
+            state["loss_scale"] = self.loss_scale.state_dict()
         if include_optimizers:
             state["actor_optimizer"] = self.actor_optimizer.state_dict()
             if self.critic_optimizer is not None:
@@ -1004,6 +1068,8 @@ class PPOTrainer:
             if self.critic_optimizer is not None:
                 self.critic_optimizer.load_state_dict(state["critic_optimizer"])
             self.optimizer_steps = int(state.get("optimizer_steps", 0))
+        if self.loss_scale is not None and "loss_scale" in state:
+            self.loss_scale.load_state_dict(state["loss_scale"])
         configure_adam(self.actor_optimizer, self.device)
         if self.critic_optimizer is not None:
             configure_adam(self.critic_optimizer, self.device)

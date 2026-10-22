@@ -41,6 +41,7 @@ import torch
 
 from cardgym.core.devices import DTYPES, Fence, autocast_context, release_device_memory, to_device, upload_packed
 
+from .graphs import DecodeGraphs, GraphedReadout, graphs_enabled
 from .selfplay import (
     CollectionStats,
     SelfPlayGame,
@@ -102,6 +103,8 @@ class _Wave:
     """One cohort's decode in flight: its policy reads on their way to the host."""
 
     launched: list = field(default_factory=list)
+    # The same, from a CUDA graph replay (cardgym.rl.graphs).
+    readout: GraphedReadout | None = None
     fence: Fence | None = None
     # Host arrays that in-flight non-blocking uploads still read from.
     keep: list[np.ndarray] = field(default_factory=list)
@@ -136,6 +139,7 @@ class ContinuousCollector:
         self._slots: list[_Slot] = []
         self._finished: dict[str, deque[Trajectory]] = {}
         self._cache = None
+        self._graphs: DecodeGraphs | None = None
         self._scratch = 0
         self._waves = [_Wave() for _ in range(self.cohorts)]
         self._width: int | None = None
@@ -147,6 +151,7 @@ class ContinuousCollector:
         self._slots = []
         self._finished = {}
         self._cache = None
+        self._graphs = None
         self._waves = [_Wave() for _ in range(self.cohorts)]
         release_device_memory(self.device)
 
@@ -210,6 +215,10 @@ class ContinuousCollector:
                 row += lane.players
         self._scratch = row
         self._cache = self.model.new_cache(row + 1, self.cache_length, self.kv_dtype)
+        if graphs_enabled(self.model, self.device):
+            self._graphs = DecodeGraphs(
+                self.model, self._cache, precision=self.precision, values=self.record_values
+            )
 
     def _satisfied(self, lanes: list[Lane]) -> bool:
         for index, lane in enumerate(lanes):
@@ -327,6 +336,18 @@ class ContinuousCollector:
             positions[index] = position
             offsets[index] = len(block) - 1
         span = _round_up(int(positions.max()) + run, self.SPAN_BUCKET)
+        if self._graphs is not None:
+            output = self._graphs.run(tokens, positions, offsets, cache_rows, span)
+            wave = self._waves[cohort]
+            wave.readout = GraphedReadout(
+                states=[state for _, state in readouts],
+                rows=[entry for entry, _ in readouts],
+                output=output.to("cpu", non_blocking=True),
+                columns=self._graphs.columns,
+            )
+            wave.fence = Fence(self.device)
+            self._count_wave(rows, run, entries, started)
+            return True
         read = np.asarray([entry for entry, _ in readouts], dtype=np.int64)
         tokens_d, positions_d, offsets_d, rows_d, index, read_offsets = upload_packed(
             upload, [tokens, positions, offsets, cache_rows, read, offsets[read]]
@@ -344,12 +365,15 @@ class ContinuousCollector:
             hidden[index], [state for _, state in readouts], context, values=self.record_values,
         )
         wave.fence = Fence(self.device)
+        self._count_wave(rows, run, entries, started)
+        return True
+
+    def _count_wave(self, rows: int, run: int, entries: list, started: float) -> None:
         self.stats.waves += 1
         self.stats.forward_rows += rows * run
         self.stats.padded_rows += rows * run - sum(len(block) for _, _, block in entries)
-        self.stats.peak_rows = max(self.stats.peak_rows, count)
+        self.stats.peak_rows = max(self.stats.peak_rows, len(entries))
         self.stats.forward_sec += time.perf_counter() - started
-        return True
 
     def _receive(self, cohort: int) -> None:
         started = time.perf_counter()
@@ -357,7 +381,10 @@ class ContinuousCollector:
         if wave.fence is not None:
             wave.fence.wait()
         self.stats.wait_sec += time.perf_counter() - started
-        receive_launched(wave.launched)
+        if wave.readout is not None:
+            wave.readout.deliver()
+        else:
+            receive_launched(wave.launched)
         self._waves[cohort] = _Wave()
 
     def _act(self, cohort: int, lanes: list[Lane], rng: random.Random, version: int) -> None:
