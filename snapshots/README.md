@@ -21,13 +21,25 @@ CARDGYM_METAL_TRUNK=1 tools/train_supervised.sh piquet partie1 configs/piquet/pa
 The train command then resumes exactly where the run stopped: weights, Adam
 state, entropy temperatures, RNG, iteration count, metrics and dashboard.
 `CARDGYM_METAL_TRUNK=1` applies only on Apple silicon; elsewhere leave it
-out. `[run] device = "auto"` picks CUDA, MPS or CPU. On an NVIDIA GPU, adopt
-the CUDA execution settings once, then supervise with them:
+out. `[run] device = "auto"` picks CUDA, MPS or CPU.
+
+A run resumes only under the config it recorded (`--reconfigure` records a
+change). `partie1` last trained on CUDA, so its snapshot carries
+`partie-cuda.toml`: fp16, two rollout workers, 8 GB microbatches. The
+training itself is the same as `partie.toml`. On an NVIDIA GPU, supervise it as
+it is:
 
 ```bash
-.venv/bin/python -m cardgym piquet train partie1 --config configs/piquet/partie-cuda.toml \
-  --reconfigure --reason "CUDA execution settings" --prepare-only
 tools/train_supervised.sh piquet partie1 configs/piquet/partie-cuda.toml
+```
+
+On Apple silicon, switch back to the MPS execution settings once, then
+supervise with them:
+
+```bash
+.venv/bin/python -m cardgym piquet train partie1 --config configs/piquet/partie.toml \
+  --reconfigure --reason "MPS execution settings" --prepare-only
+CARDGYM_METAL_TRUNK=1 tools/train_supervised.sh piquet partie1 configs/piquet/partie.toml
 ```
 
 To pack a run again afterwards:
@@ -38,10 +50,11 @@ To pack a run again afterwards:
 
 | Snapshot | Iteration | Notes |
 | --- | --- | --- |
-| `piquet/partie1` | 300 | Rubicon parties, fine-tuned from p2 at iteration 13600 (`checkpoints/piquet/p2`); see `docs/piquet.md#parties` |
+| `piquet/partie1` | 12700 | Rubicon parties, fine-tuned from p2 at iteration 13600 (`checkpoints/piquet/p2`); see `docs/piquet.md#parties`. Iterations 1-300 on the Mac, 301-12700 on an RTX 2070 Super |
 
-Throughput on the machine that trained it: an Apple M5 Pro laptop with
-24 GB, MPS, bf16, the Metal trunk and one asynchronous rollout worker.
+Throughput on the Apple M5 Pro laptop (24 GB, MPS, bf16, the Metal trunk,
+one asynchronous rollout worker); for the RTX 2070 Super see
+`docs/piquet.md#cuda` (`partie1`: 3.6-3.9 s per update).
 
 - **`partie1`:** 3.7-3.8 s per update of 192 parties (1152 deals, ~36k
   decisions). That is about 9.5k decisions per second, or roughly

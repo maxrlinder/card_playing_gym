@@ -11,8 +11,25 @@
     "--reset-iteration",
     "--prepare-only"
   ],
+  "config_migrations": [
+    {
+      "at": "2026-10-22T15:02:19Z",
+      "changes": [
+        "ppo.device_cache_gb: recorded=6.0 requested=4.0",
+        "ppo.sequence_bucket_width: recorded=64 requested=4",
+        "rollout.cohorts: recorded=None requested=2",
+        "rollout.workers: recorded=1 requested=2",
+        "run.precision: recorded='bf16' requested='fp16'"
+      ],
+      "iteration": 300,
+      "previous_config": "config-history/iter_000300.toml",
+      "reason": "Moved to CUDA (RTX 2070 Super, 8 GB): fp16 autocast with dynamic loss scaling (Turing emulates bf16), microbatches/length buckets/cache ceiling for 8 GB, two rollout workers with two cohorts. Same training: parties, PPO, model, losses, games per update.",
+      "resume_checkpoint": "resume_000300_reconfigured.pt",
+      "resume_sha256": "4caf5c49bb73b54b1aa428129efa0d586c97dd11a11487986f6a5caa69c82386"
+    }
+  ],
   "created_at": "2026-10-22T06:56:11Z",
-  "device": "mps",
+  "device": "cuda",
   "game": "piquet",
   "git": {
     "branch": "rummy",
@@ -21,11 +38,11 @@
   },
   "parent": "/Users/erehmax/Documents/Projects/Personal/card_playing_gym/runs/piquet/p2/checkpoints/iter_013600.pt",
   "parent_iteration": 13600,
-  "prepared_iteration": 0,
+  "prepared_iteration": 300,
   "python": "3.12.13 (main, Apr 14 2026, 14:33:40) [Clang 22.1.3 ]",
   "run": "partie1",
   "status": "running",
   "target_iterations": 1000000,
   "torch": "2.13.0.dev20260518",
-  "updated_at": "2026-10-22T06:56:13Z"
+  "updated_at": "2026-10-23T02:49:27Z"
 }

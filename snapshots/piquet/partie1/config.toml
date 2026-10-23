@@ -4,7 +4,7 @@ iterations = 1000000
 checkpoint_every = 100
 dashboard_every = 50
 device = "auto"
-precision = "bf16"
+precision = "fp16"
 seed = 1
 
 [rollout]
@@ -12,7 +12,8 @@ kv_dtype = "fp16"
 mode = "continuous"
 concurrency = 1.0
 asynchronous = true
-workers = 1
+workers = 2
+cohorts = 2
 
 [model]
 d_model = 256
@@ -46,8 +47,8 @@ auxiliary_grad_refresh = 4
 entropy_mode = "adaptive"
 entropy_targets = { exchange = 0.05, declare = 0.05, play = 0.05 }
 microbatch_positions = 16384
-device_cache_gb = 6.0
-sequence_bucket_width = 64
+device_cache_gb = 4.0
+sequence_bucket_width = 4
 min_group_sequences = 32
 
 [game]

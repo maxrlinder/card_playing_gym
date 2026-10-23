@@ -1,10 +1,10 @@
 {
   "game": "piquet",
   "run": "partie1",
-  "checkpoint": "iter_000300.pt",
-  "iteration": 300,
+  "checkpoint": "iter_012700.pt",
+  "iteration": 12700,
   "sha256": {
-    "checkpoint.pt": "4c35b9c47f2ebe12bcb79d0713167eafca41031a5e5aff8a1969a755b21a56d6",
-    "optimizer.pt": "797a079db84cb08be8da12964ead29d27e05447b82408fe084491c8861ce4c23"
+    "checkpoint.pt": "b6f01d91873325e9247ed66647367a8eec1a18ae0af562006b8d3ba44d1c063c",
+    "optimizer.pt": "3aff4c4a03e4b63365947a4661497796fdca6317053edddcfa4ce6fbcb5b936a"
   }
 }
